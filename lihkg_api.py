@@ -63,8 +63,81 @@ class RateLimiter:
             self.requests = self.requests[1:]
         self.requests.append(now)
 
-# 初始化速率限制器，放寬為每 60 秒 50 次請求
+class ApiClient:
+    """
+    LIHKG API 客戶端，處理共用請求邏輯。
+    """
+    def __init__(self, rate_limiter: RateLimiter):
+        self.rate_limiter = rate_limiter
+        self.base_url = LIHKG_BASE_URL
+        self.device_id = LIHKG_DEVICE_ID
+        self.cookie = LIHKG_COOKIE
+
+    def generate_headers(self, url: str, timestamp: int):
+        digest = hashlib.sha1(f"jeams$get${url.replace('[', '%5b').replace(']', '%5d').replace(',', '%2c')}${timestamp}".encode()).hexdigest()
+        return {
+            "User-Agent": random.choice(USER_AGENTS),
+            "X-LI-DEVICE": self.device_id,
+            "X-LI-REQUEST-TIME": str(timestamp),
+            "X-LI-DIGEST": digest,
+            "Cookie": self.cookie,
+            "Accept": "application/json",
+            "Accept-Language": "zh-HK,zh-Hant;q=0.9,en;q=0.8",
+            "Connection": "keep-alive",
+            "Referer": url.rsplit('/', 1)[0]
+        }
+
+    async def get(self, url: str, function_name: str, params=None, max_retries=3, timeout=10):
+        timestamp = int(time.time())
+        headers = self.generate_headers(url, timestamp)
+        rate_limit_info = []
+        for attempt in range(max_retries):
+            try:
+                await self.rate_limiter.acquire()
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url, headers=headers, params=params, timeout=timeout) as response:
+                        status = "success" if response.status == 200 else f"failed_status_{response.status}"
+                        logger.info(
+                            json.dumps({
+                                "event": "lihkg_api_request",
+                                "function": function_name,
+                                "url": url,
+                                "status": status
+                            }, ensure_ascii=False)
+                        )
+                        if response.status == 429:
+                            wait_time = int(response.headers.get("Retry-After", "5"))
+                            rate_limit_info.append(f"{datetime.now():%Y-%m-%d %H:%M:%S} - Rate limit hit, waiting {wait_time:.2f} seconds")
+                            logger.warning(f"Rate limit hit for {function_name}, url={url}")
+                            await asyncio.sleep(wait_time)
+                            continue
+                        if response.status != 200:
+                            logger.error(f"Fetch failed: {function_name}, url={url}, status={response.status}")
+                            break
+                        data = await response.json()
+                        if not data.get("success"):
+                            logger.error(f"API error: {function_name}, url={url}, message={data.get('error_message', 'Unknown')}")
+                            break
+                        return data, rate_limit_info
+            except Exception as e:
+                logger.error(
+                    json.dumps({
+                        "event": "lihkg_api_request",
+                        "function": function_name,
+                        "url": url,
+                        "status": "failed",
+                        "error": str(e)
+                    }, ensure_ascii=False)
+                )
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(2)
+                    continue
+                break
+        return None, rate_limit_info
+
+# 初始化速率限制器和客戶端
 rate_limiter = RateLimiter(max_requests=50, period=60)
+api_client = ApiClient(rate_limiter)
 
 def get_category_name(cat_id):
     """
@@ -80,22 +153,8 @@ async def get_lihkg_topic_list(cat_id, start_page=1, max_pages=3, request_counte
     """
     抓取指定分類的帖子標題列表。
     """
-    timestamp = int(time.time())
-    url_template = f"{LIHKG_BASE_URL}/api_v2/thread/latest?cat_id={cat_id}&page={{page}}&count=60&type=now&order=now"
-    headers = {
-        "User-Agent": random.choice(USER_AGENTS),
-        "X-LI-DEVICE": LIHKG_DEVICE_ID,
-        "X-LI-REQUEST-TIME": str(timestamp),
-        "Cookie": LIHKG_COOKIE,
-        "Accept": "application/json",
-        "Accept-Language": "zh-HK,zh-Hant;q=0.9,en;q=0.8",
-        "Connection": "keep-alive",
-        "Referer": f"{LIHKG_BASE_URL}/category/{cat_id}",
-    }
-    
     items = []
     rate_limit_info = []
-    max_retries = 3
     current_time = time.time()
     
     if current_time < rate_limit_until:
@@ -106,64 +165,24 @@ async def get_lihkg_topic_list(cat_id, start_page=1, max_pages=3, request_counte
             "last_reset": last_reset, "rate_limit_until": rate_limit_until
         }
     
-    async with aiohttp.ClientSession() as session:
-        for page in range(start_page, start_page + max_pages):
-            if current_time - last_reset >= 60:
-                request_counter = 0
-                last_reset = current_time
-            
-            url = url_template.format(page=page)
-            digest = hashlib.sha1(f"jeams$get${url.replace('[', '%5b').replace(']', '%5d').replace(',', '%2c')}${timestamp}".encode()).hexdigest()
-            headers["X-LI-DIGEST"] = digest
-            
-            for attempt in range(max_retries):
-                try:
-                    await rate_limiter.acquire()
-                    request_counter += 1
-                    async with session.get(url, headers=headers, timeout=10) as response:
-                        status = "success" if response.status == 200 else f"failed_status_{response.status}"
-                        logger.info(
-                            json.dumps({
-                                "event": "lihkg_api_request",
-                                "function": "get_lihkg_topic_list",
-                                "url": url,
-                                "status": status
-                            }, ensure_ascii=False)
-                        )
-                        
-                        if response.status == 429:
-                            wait_time = int(response.headers.get("Retry-After", "5"))
-                            rate_limit_until = time.time() + wait_time
-                            rate_limit_info.append(f"{datetime.now():%Y-%m-%d %H:%M:%S} - Rate limit hit, waiting {wait_time:.2f} seconds")
-                            logger.warning(f"Rate limit hit for cat_id={cat_id}, page={page}, waiting {wait_time:.2f} seconds")
-                            await asyncio.sleep(wait_time)
-                            continue
-                        
-                        if response.status != 200:
-                            logger.error(f"Fetch failed: cat_id={cat_id}, page={page}, status={response.status}")
-                            break
-                        
-                        data = await response.json()
-                        if not data.get("success"):
-                            logger.error(f"API error: cat_id={cat_id}, page={page}, message={data.get('error_message', 'Unknown')}")
-                            break
-                        
-                        filtered_items = [item for item in data["response"]["items"] if item.get("title") and item.get("no_of_reply", 0) > 0]
-                        items.extend(filtered_items)
-                        logger.info(f"Fetched cat_id={cat_id}, page={page}, items={len(filtered_items)}")
-                        break
-                except Exception as e:
-                    logger.error(
-                        json.dumps({
-                            "event": "lihkg_api_request",
-                            "function": "get_lihkg_topic_list",
-                            "url": url,
-                            "status": "failed",
-                            "error": str(e)
-                        }, ensure_ascii=False)
-                    )
-                    break
-            await asyncio.sleep(1)
+    if current_time - last_reset >= 60:
+        request_counter = 0
+        last_reset = current_time
+    
+    for page in range(start_page, start_page + max_pages):
+        url = f"{LIHKG_BASE_URL}/api_v2/thread/latest?cat_id={cat_id}&page={page}&count=60&type=now&order=now"
+        data, page_rate_limit_info = await api_client.get(url, "get_lihkg_topic_list")
+        request_counter += 1
+        rate_limit_info.extend(page_rate_limit_info)
+        
+        if data and data.get("response", {}).get("items"):
+            filtered_items = [item for item in data["response"]["items"] if item.get("title") and item.get("no_of_reply", 0) > 0]
+            items.extend(filtered_items)
+            logger.info(f"Fetched cat_id={cat_id}, page={page}, items={len(filtered_items)}")
+        else:
+            logger.error(f"No data fetched for cat_id={cat_id}, page={page}")
+        
+        await asyncio.sleep(1)
     
     return {
         "items": items[:90],
@@ -173,91 +192,10 @@ async def get_lihkg_topic_list(cat_id, start_page=1, max_pages=3, request_counte
         "rate_limit_until": rate_limit_until
     }
 
-async def fetch_thread_page(session, url, headers, thread_id, page, max_replies, rate_limiter, request_counter, rate_limit_until):
-    """
-    抓取單個帖子頁面的回覆內容。
-    """
-    rate_limit_info = []
-    max_retries = 3
-    replies = []
-    # 確保 max_replies 至少為 100
-    max_replies = max(max_replies, 100)
-    
-    for attempt in range(max_retries):
-        try:
-            await rate_limiter.acquire()
-            request_counter += 1
-            async with session.get(url, headers=headers, timeout=10) as response:
-                status = "success" if response.status == 200 else f"failed_status_{response.status}"
-                logger.info(
-                    json.dumps({
-                        "event": "lihkg_api_request",
-                        "function": "fetch_thread_page",
-                        "url": url,
-                        "status": status,
-                        "max_replies": max_replies
-                    }, ensure_ascii=False)
-                )
-                
-                if response.status == 429:
-                    wait_time = int(response.headers.get("Retry-After", "5"))
-                    rate_limit_until = time.time() + wait_time
-                    rate_limit_info.append(f"{datetime.now():%Y-%m-%d %H:%M:%S} - Rate limit hit, waiting {wait_time:.2f} seconds")
-                    logger.warning(f"Rate limit hit for thread_id={thread_id}, page={page}")
-                    await asyncio.sleep(wait_time)
-                    continue
-                
-                if response.status != 200:
-                    logger.error(f"Fetch failed: thread_id={thread_id}, page={page}, status={response.status}")
-                    break
-                
-                data = await response.json()
-                if not data.get("success"):
-                    logger.warning(f"API error: thread_id={thread_id}, page={page}, message={data.get('error_message', 'Unknown')}")
-                    break
-                
-                page_replies = data["response"].get("item_data", [])
-                for reply in page_replies:
-                    reply["like_count"] = int(reply.get("like_count", "0"))
-                    reply["dislike_count"] = int(reply.get("dislike_count", "0"))
-                    reply["reply_time"] = reply.get("reply_time", "0")
-                
-                remaining_slots = max_replies - len(replies)
-                page_replies = page_replies[:remaining_slots]
-                replies.extend(page_replies)
-                logger.info(f"Fetched thread_id={thread_id}, page={page}, replies={len(page_replies)}")
-                break
-        except Exception as e:
-            logger.error(
-                json.dumps({
-                    "event": "lihkg_api_request",
-                    "function": "fetch_thread_page",
-                    "url": url,
-                    "status": "failed",
-                    "error": str(e)
-                }, ensure_ascii=False)
-            )
-            break
-    
-    return replies, page, request_counter, rate_limit_until, rate_limit_info
-
 async def get_lihkg_thread_content(thread_id, cat_id=None, request_counter=0, last_reset=0, rate_limit_until=0, max_replies=600, fetch_last_pages=0, specific_pages=None, start_page=1):
     """
     抓取指定帖子的回覆內容。
     """
-    timestamp = int(time.time())
-    url_template = f"{LIHKG_BASE_URL}/api_v2/thread/{thread_id}/page/{{page}}?order=reply_time"
-    headers = {
-        "User-Agent": random.choice(USER_AGENTS),
-        "X-LI-DEVICE": LIHKG_DEVICE_ID,
-        "X-LI-REQUEST-TIME": str(timestamp),
-        "Cookie": LIHKG_COOKIE,
-        "Accept": "application/json",
-        "Accept-Language": "zh-HK,zh-Hant;q=0.9,en;q=0.8",
-        "Connection": "keep-alive",
-        "Referer": f"{LIHKG_BASE_URL}/thread/{thread_id}",
-    }
-    
     replies = []
     fetched_pages = []
     thread_title = None
@@ -265,7 +203,6 @@ async def get_lihkg_thread_content(thread_id, cat_id=None, request_counter=0, la
     total_pages = None
     rate_limit_info = []
     current_time = time.time()
-    # 確保 max_replies 至少為 100
     max_replies = max(max_replies, 100)
     
     if current_time < rate_limit_until:
@@ -277,117 +214,78 @@ async def get_lihkg_thread_content(thread_id, cat_id=None, request_counter=0, la
             "request_counter": request_counter, "last_reset": last_reset, "rate_limit_until": rate_limit_until
         }
     
-    async with aiohttp.ClientSession() as session:
-        url = url_template.format(page=1)
-        digest = hashlib.sha1(f"jeams$get${url.replace('[', '%5b').replace(']', '%5d').replace(',', '%2c')}${timestamp}".encode()).hexdigest()
-        headers["X-LI-DIGEST"] = digest
+    if current_time - last_reset >= 60:
+        request_counter = 0
+        last_reset = current_time
+    
+    # 抓取第一頁
+    url = f"{LIHKG_BASE_URL}/api_v2/thread/{thread_id}/page/1?order=reply_time"
+    data, page_rate_limit_info = await api_client.get(url, "get_lihkg_thread_content")
+    request_counter += 1
+    rate_limit_info.extend(page_rate_limit_info)
+    
+    if data and data.get("response"):
+        response_data = data.get("response", {})
+        thread_title = response_data.get("title") or response_data.get("thread", {}).get("title")
+        total_replies = response_data.get("total_replies", 0)
+        total_pages = response_data.get("total_page", 1)
         
-        try:
-            await rate_limiter.acquire()
-            request_counter += 1
-            async with session.get(url, headers=headers, timeout=10) as response:
-                status = "success" if response.status == 200 else f"failed_status_{response.status}"
-                logger.info(
-                    json.dumps({
-                        "event": "lihkg_api_request",
-                        "function": "get_lihkg_thread_content",
-                        "url": url,
-                        "status": status,
-                        "max_replies": max_replies
-                    }, ensure_ascii=False)
-                )
-                
-                if response.status == 429:
-                    wait_time = int(response.headers.get("Retry-After", "5"))
-                    rate_limit_until = time.time() + wait_time
-                    rate_limit_info.append(f"{datetime.now():%Y-%m-%d %H:%M:%S} - Rate limit hit, waiting {wait_time:.2f} seconds")
-                    logger.warning(f"Rate limit hit for thread_id={thread_id}, page=1")
-                    return {
-                        "replies": [], "title": None, "total_replies": 0, "total_pages": 0,
-                        "fetched_pages": fetched_pages, "rate_limit_info": rate_limit_info,
-                        "request_counter": request_counter, "last_reset": last_reset, "rate_limit_until": rate_limit_until
-                    }
-                
-                if response.status != 200:
-                    logger.error(f"Fetch failed: thread_id={thread_id}, page=1, status={response.status}")
-                    return {
-                        "replies": [], "title": None, "total_replies": 0, "total_pages": 0,
-                        "fetched_pages": fetched_pages, "rate_limit_info": rate_limit_info,
-                        "request_counter": request_counter, "last_reset": last_reset, "rate_limit_until": rate_limit_until
-                    }
-                
-                data = await response.json()
-                if not data.get("success"):
-                    logger.warning(f"API error: thread_id={thread_id}, page=1, message={data.get('error_message', 'Unknown')}")
-                    return {
-                        "replies": [], "title": None, "total_replies": 0, "total_pages": 0,
-                        "fetched_pages": fetched_pages, "rate_limit_info": rate_limit_info,
-                        "request_counter": request_counter, "last_reset": last_reset, "rate_limit_until": rate_limit_until
-                    }
-                
-                response_data = data.get("response", {})
-                thread_title = response_data.get("title") or response_data.get("thread", {}).get("title")
-                total_replies = response_data.get("total_replies", 0)
-                total_pages = response_data.get("total_page", 1)
-                
-                page_replies = response_data.get("item_data", [])
-                for reply in page_replies:
-                    reply["like_count"] = int(reply.get("like_count", "0"))
-                    reply["dislike_count"] = int(reply.get("dislike_count", "0"))
-                    reply["reply_time"] = reply.get("reply_time", "0")
-                replies.extend(page_replies[:max_replies])
-                fetched_pages.append(1)
-                logger.info(f"Fetched thread_id={thread_id}, page=1, replies={len(page_replies)}, total_stored={len(replies)}")
+        page_replies = response_data.get("item_data", [])
+        for reply in page_replies:
+            reply["like_count"] = int(reply.get("like_count", "0"))
+            reply["dislike_count"] = int(reply.get("dislike_count", "0"))
+            reply["reply_time"] = reply.get("reply_time", "0")
+        replies.extend(page_replies[:max_replies])
+        fetched_pages.append(1)
+        logger.info(f"Fetched thread_id={thread_id}, page=1, replies={len(page_replies)}, total_stored={len(replies)}")
+    else:
+        logger.error(f"No data fetched for thread_id={thread_id}, page=1")
+        return {
+            "replies": [], "title": None, "total_replies": 0, "total_pages": 0,
+            "fetched_pages": fetched_pages, "rate_limit_info": rate_limit_info,
+            "request_counter": request_counter, "last_reset": last_reset, "rate_limit_until": rate_limit_until
+        }
+    
+    # 確定後續頁面
+    pages_to_fetch = []
+    if specific_pages:
+        pages_to_fetch = [p for p in specific_pages if 1 <= p <= total_pages and p not in fetched_pages]
+    elif fetch_last_pages > 0:
+        start = max(start_page, 2)
+        end = total_pages + 1
+        if end - start < fetch_last_pages:
+            start = max(2, end - fetch_last_pages)
+        pages_to_fetch = list(range(start, end))[:fetch_last_pages]
+        pages_to_fetch = [p for p in pages_to_fetch if p not in fetched_pages and 1 <= p <= total_pages]
+    elif start_page > 1:
+        pages_to_fetch = list(range(start_page, total_pages + 1))
+        pages_to_fetch = [p for p in pages_to_fetch if p not in fetched_pages]
+    
+    pages_to_fetch = sorted(set(pages_to_fetch))
+    
+    # 抓取後續頁面
+    for page in pages_to_fetch:
+        if len(replies) >= max_replies:
+            logger.info(f"Stopped fetching: thread_id={thread_id}, replies={len(replies)} reached max {max_replies}")
+            break
         
-        except Exception as e:
-            logger.error(
-                json.dumps({
-                    "event": "lihkg_api_request",
-                    "function": "get_lihkg_thread_content",
-                    "url": url,
-                    "status": "failed",
-                    "error": str(e)
-                }, ensure_ascii=False)
-            )
-            return {
-                "replies": [], "title": None, "total_replies": 0, "total_pages": 0,
-                "fetched_pages": fetched_pages, "rate_limit_info": rate_limit_info,
-                "request_counter": request_counter, "last_reset": last_reset, "rate_limit_until": rate_limit_until
-            }
+        url = f"{LIHKG_BASE_URL}/api_v2/thread/{thread_id}/page/{page}?order=reply_time"
+        data, page_rate_limit_info = await api_client.get(url, "fetch_thread_page")
+        request_counter += 1
+        rate_limit_info.extend(page_rate_limit_info)
         
-        pages_to_fetch = []
-        if specific_pages:
-            pages_to_fetch = [p for p in specific_pages if 1 <= p <= total_pages and p not in fetched_pages]
-        elif fetch_last_pages > 0:
-            start = max(start_page, 2)
-            end = total_pages + 1
-            if end - start < fetch_last_pages:
-                start = max(2, end - fetch_last_pages)
-            pages_to_fetch = list(range(start, end))[:fetch_last_pages]
-            pages_to_fetch = [p for p in pages_to_fetch if p not in fetched_pages and 1 <= p <= total_pages]
-        elif start_page > 1:
-            pages_to_fetch = list(range(start_page, total_pages + 1))
-            pages_to_fetch = [p for p in pages_to_fetch if p not in fetched_pages]
-        
-        pages_to_fetch = sorted(set(pages_to_fetch))
-        
-        for page in pages_to_fetch:
-            if len(replies) >= max_replies:
-                logger.info(f"Stopped fetching: thread_id={thread_id}, replies={len(replies)} reached max {max_replies}")
-                break
-            
-            url = url_template.format(page=page)
-            digest = hashlib.sha1(f"jeams$get${url.replace('[', '%5b').replace(']', '%5d').replace(',', '%2c')}${timestamp}".encode()).hexdigest()
-            headers["X-LI-DIGEST"] = digest
-            
-            page_replies, fetched_page, request_counter, rate_limit_until, page_rate_limit_info = await fetch_thread_page(
-                session, url, headers, thread_id, page, max_replies, rate_limiter, request_counter, rate_limit_until
-            )
+        if data and data.get("response"):
+            page_replies = data["response"].get("item_data", [])
+            for reply in page_replies:
+                reply["like_count"] = int(reply.get("like_count", "0"))
+                reply["dislike_count"] = int(reply.get("dislike_count", "0"))
+                reply["reply_time"] = reply.get("reply_time", "0")
+            remaining_slots = max_replies - len(replies)
+            page_replies = page_replies[:remaining_slots]
             replies.extend(page_replies)
-            fetched_pages.append(fetched_page)
-            rate_limit_info.extend(page_rate_limit_info)
-            logger.info(f"After fetching page {page}, thread_id={thread_id}, total_replies={len(replies)}")
-            await asyncio.sleep(1)
+            fetched_pages.append(page)
+            logger.info(f"Fetched thread_id={thread_id}, page={page}, replies={len(page_replies)}")
+        await asyncio.sleep(1)
     
     return {
         "replies": replies, "title": thread_title, "total_replies": total_replies,
