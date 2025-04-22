@@ -14,10 +14,25 @@ import nest_asyncio
 import logging
 from grok_processing import analyze_and_screen, stream_grok3_response, process_user_question
 
-# 配置日誌記錄器
+# 香港時區
+HONG_KONG_TZ = pytz.timezone("Asia/Hong_Kong")
+
+# 配置日誌記錄器，設置為香港時區
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
-formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+
+# 自定義日誌格式器，將時間戳設為香港時區
+class HongKongFormatter(logging.Formatter):
+    def formatTime(self, record, datefmt=None):
+        dt = datetime.fromtimestamp(record.created, tz=HONG_KONG_TZ)
+        if datefmt:
+            return dt.strftime(datefmt)
+        else:
+            return dt.strftime("%Y-%m-%d %H:%M:%S,%f")[:-3]
+
+formatter = HongKongFormatter("%(asctime)s - %(levelname)s - %(message)s")
+
+# 清空默認處理器並添加新處理器
 logger.handlers.clear()
 file_handler = logging.FileHandler("app.log")
 file_handler.setFormatter(formatter)
@@ -29,13 +44,26 @@ logger.addHandler(stream_handler)
 # 應用 asyncio 補丁
 nest_asyncio.apply()
 
-# 香港時區
-HONG_KONG_TZ = pytz.timezone("Asia/Hong_Kong")
+def validate_input(user_question):
+    """
+    驗證用戶輸入，確保長度、格式有效。
+    """
+    if not user_question:
+        return False, "輸入不能為空"
+    if len(user_question) < 5:
+        return False, "輸入過短，至少5個字"
+    if len(user_question) > 200:
+        return False, "輸入過長，最多200個字"
+    if not any(c.isalnum() for c in user_question):
+        return False, "輸入需包含字母或數字"
+    return True, ""
 
 async def main():
     """
     主函數，初始化 Streamlit 應用，處理用戶輸入並渲染聊天介面。
     """
+    # 設置 Streamlit 頁面配置
+    st.set_page_config(page_title="LIHKG 聊天介面", layout="wide")
     st.title("LIHKG 聊天介面")
 
     # 初始化 session_state
@@ -49,8 +77,6 @@ async def main():
         st.session_state.request_counter = 0
     if "last_reset" not in st.session_state:
         st.session_state.last_reset = time.time()
-    if "last_user_query" not in st.session_state:
-        st.session_state.last_user_query = None
     if "awaiting_response" not in st.session_state:
         st.session_state.awaiting_response = False
     if "conversation_context" not in st.session_state:
@@ -84,6 +110,14 @@ async def main():
     # 用戶輸入
     user_question = st.chat_input("請輸入 LIHKG 話題或一般問題")
     if user_question and not st.session_state.awaiting_response:
+        # 驗證輸入
+        is_valid, error_message = validate_input(user_question)
+        if not is_valid:
+            with st.chat_message("assistant"):
+                st.error(error_message)
+            st.session_state.chat_history.append({"question": user_question, "answer": error_message})
+            return
+        
         logger.info(f"User query: {user_question}, category: {selected_cat}, cat_id: {cat_id}")
         with st.chat_message("user"):
             st.markdown(user_question)
@@ -116,6 +150,8 @@ async def main():
                 return
 
             # 重置聊天記錄
+            if "last_user_query" not in st.session_state:
+                st.session_state.last_user_query = None
             if not st.session_state.last_user_query or len(set(user_question.split()).intersection(set(st.session_state.last_user_query.split()))) < 2:
                 st.session_state.chat_history = [{"question": user_question, "answer": ""}]
                 st.session_state.thread_cache = {}
