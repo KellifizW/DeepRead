@@ -4,3 +4,5 @@ nest_asyncio
 pytz
 tzlocal
 nltk
+praw
+asyncpraw
