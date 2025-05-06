@@ -25,11 +25,11 @@ CONFIG = {
         "follow_up": (1000, 2500),
         "fetch_thread_by_id": (500, 1000),
         "general_query": (500, 1000),
-        "list_titles": (200, 600),
+        "list_titles": (500, 1500),
         "find_themed": (700, 1500),
         "fetch_dates": (500, 1000),
         "search_keywords": (700, 1500),
-        "recommend_threads": (500, 1000),
+        "recommend_threads": (500, 1500),
         "time_sensitive_analysis": (500, 1000),
         "contextual_analysis": (700, 1500)
     }
@@ -85,6 +85,26 @@ async def parse_query(query, conversation_context, grok3_api_key, source_type="l
             "time_range": "all",
             "thread_ids": [thread_id],
             "reason": f"檢測到追問，匹配帖子 ID {thread_id}，原因：{match_reason}",
+            "confidence": 0.90
+        }
+    
+    # 檢查是否為情緒分析查詢
+    sentiment_triggers = ["情緒", "氣氛", "指數", "正負面", "sentiment", "mood"]
+    is_sentiment_query = any(word in query for word in sentiment_triggers)
+    if is_sentiment_query:
+        logger.info(f"檢測到情緒分析查詢：query={query}")
+        intents = [
+            {"intent": "analyze_sentiment", "confidence": 0.90, "reason": "檢測到情緒分析關鍵詞，需分析情緒比例"},
+            {"intent": "summarize_posts", "confidence": 0.80, "reason": "情緒分析查詢，輔以總結"}
+        ]
+        time_range = "recent" if time_sensitive else "all"
+        return {
+            "intents": intents,
+            "keywords": keywords,
+            "related_terms": related_terms,
+            "time_range": time_range,
+            "thread_ids": [],
+            "reason": "檢測到情緒分析查詢，優先分析情緒比例",
             "confidence": 0.90
         }
     
@@ -157,7 +177,7 @@ async def parse_query(query, conversation_context, grok3_api_key, source_type="l
 {json.dumps({
     "list_titles": "列出帖子標題或清單（觸發詞：列出、標題、清單、所有標題）",
     "summarize_posts": "總結帖子內容或討論",
-    "analyze_sentiment": "分析帖子或回覆的情緒",
+    "analyze_sentiment": "分析帖子或回覆的情緒（觸發詞：情緒、氣氛、指數、正負面、sentiment、mood）",
     "general_query": "模糊或非討論區相關問題",
     "find_themed": "尋找特定主題的帖子",
     "fetch_dates": "提取帖子或回覆的日期資料",
@@ -176,6 +196,7 @@ async def parse_query(query, conversation_context, grok3_api_key, source_type="l
   "reason": "整體匹配原因"
 }}
 若查詢包含「列出」「標題」「清單」「所有標題」，優先返回 list_titles 意圖，信心值設為 0.95。
+若查詢包含「情緒」「氣氛」「指數」「正負面」「sentiment」「mood」，優先 analyze_sentiment 意圖。
 若查詢包含「Reddit」「LIHKG」「子版」「討論區」，優先 contextual_analysis 意圖。
 若查詢包含時間敏感詞（如「今晚」「今日」），優先 time_sensitive_analysis 意圖。
 若查詢模糊且無多意圖指示詞，僅返回1個高信心意圖（優先 list_titles 若包含觸發詞，否則 summarize_posts）。
@@ -342,7 +363,7 @@ async def extract_relevant_thread(conversation_context, query, grok3_api_key):
         return None, None, None, "無對話歷史"
     
     query_keyword_result = await extract_keywords(query, conversation_context, grok3_api_key)
-    query_keywords = set(query_keyword_result["keywords"] + query_keyword_result["related_terms"])
+    query_keywords = query_keyword_result["keywords"] + query_keyword_result["related_terms"]
     
     follow_up_phrases = ["詳情", "更多", "進一步", "點解", "為什麼", "原因", "講多D", "再講", "繼續", "仲有咩"]
     is_follow_up_query = any(phrase in query for phrase in follow_up_phrases)
@@ -353,8 +374,8 @@ async def extract_relevant_thread(conversation_context, query, grok3_api_key):
             matches = re.findall(r"\[帖子 ID: ([a-zA-Z0-9]+)\] ([^\n]+)", message["content"])
             for thread_id, title in matches:
                 title_keyword_result = await extract_keywords(title, conversation_context, grok3_api_key)
-                title_keywords = set(title_keyword_result["keywords"] + title_keyword_result["related_terms"])
-                common_keywords = query_keywords.intersection(title_keywords)
+                title_keywords = title_keyword_result["keywords"] + title_keyword_result["related_terms"]
+                common_keywords = set(query_keywords).intersection(set(title_keywords))
                 content_contains_keywords = any(kw.lower() in message["content"].lower() for kw in query_keywords)
                 if common_keywords or content_contains_keywords or is_follow_up_query:
                     return thread_id, title, message["content"], f"關鍵詞匹配：{common_keywords or query_keywords}, 追問詞：{is_follow_up_query}"
@@ -455,8 +476,8 @@ async def build_dynamic_prompt(query, conversation_context, metadata, thread_dat
     
     prompt_length = len(context) + len(data) + len(system) + 500
     length_factor = min(prompt_length / CONFIG["max_prompt_length"], 1.0)
-    context_factor = len(conversation_context) / 10  # 考慮對話歷史長度
-    keyword_factor = len(keywords) / CONFIG["max_keywords"]  # 考慮關鍵詞數量
+    context_factor = len(conversation_context) / 10
+    keyword_factor = len(keywords) / CONFIG["max_keywords"]
     word_min = int(word_min + (word_max - word_min) * (length_factor * 0.3 + context_factor * 0.2 + keyword_factor * 0.1))
     word_max = int(word_min + (word_max - word_min) * (1 + length_factor * 0.5 + context_factor * 0.1 + keyword_factor * 0.1))
     

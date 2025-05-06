@@ -186,7 +186,7 @@ async def get_lihkg_topic_list(cat_id, start_page=1, max_pages=3):
     
     for page in range(start_page, start_page + max_pages):
         if cat_id == "2":  # 熱門台
-            url = f"{LIHKG_BASE_URL}/api_v2/thread/hot?cat_id={cat_id}&page={page}&count=60&type=now"
+            url = f"{LIHKG_BASE_URL}/api_v2/thread/latest?cat_id=1&page={page}&count=60&type=now&order=hot"
         else:
             url = f"{LIHKG_BASE_URL}/api_v2/thread/category?cat_id={cat_id}&page={page}&count=60&type=now"
         data, page_rate_limit_info, rate_limit_data = await api_client.get(url, "get_lihkg_topic_list")

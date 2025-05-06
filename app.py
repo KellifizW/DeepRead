@@ -7,6 +7,7 @@ import nest_asyncio
 from streamlit.components.v1 import html
 from grok_processing import analyze_and_screen, stream_grok3_response, process_user_question
 from logging_config import configure_logger
+import uuid
 
 HONG_KONG_TZ = pytz.timezone("Asia/Hong_Kong")
 logger = configure_logger(__name__, "app.log")
@@ -160,17 +161,29 @@ async def main():
         status_text = st.empty()
         progress_bar = st.progress(0)
 
-        def update_progress(message, progress):
-            status_text.write(f"正在處理... {message}")
+        def update_progress(message, progress, source_type=None, details=None):
+            if source_type == "reddit":
+                if details and "current_comments" in details and "total_comments" in details:
+                    message = f"{message} ({details['current_comments']}/{details['total_comments']} 條評論)"
+                elif details and "wait_time" in details:
+                    message = f"{message} (等待速率限制 {details['wait_time']:.2f} 秒)"
+            elif source_type == "lihkg":
+                if details and "current_page" in details and "total_pages" in details:
+                    message = f"{message} (第 {details['current_page']}/{details['total_pages']} 頁)"
+                elif details and "current_thread" in details and "total_threads" in details:
+                    message = f"{message} (第 {details['current_thread']}/{details['total_threads']} 帖子)"
+                elif details and "wait_time" in details:
+                    message = f"{message} (等待速率限制 {details['wait_time']:.2f} 秒)"
+            status_text.write(f"正在處理：{message}")
             progress_bar.progress(min(max(progress, 0.0), 1.0))
 
         try:
-            update_progress("正在初始化", 0.0)
+            update_progress("初始化查詢", 0.05)
 
             st.session_state.chat_history.append({"question": user_query, "answer": ""})
             st.session_state.last_user_query = user_query
 
-            update_progress("正在分析問題意圖", 0.1)
+            update_progress("分析問題意圖", 0.15)
             analysis = await analyze_and_screen(
                 user_query=user_query,
                 source_name=selected_cat,
@@ -187,8 +200,9 @@ async def main():
                 if time.time() - cached_data["timestamp"] < 300:  # 緩存 5 分鐘
                     logger.info(f"使用 app 層緩存數據，來源：{source_id}")
                     result = cached_data["data"]
+                    update_progress("從緩存載入數據", 0.35, source_type)
                 else:
-                    update_progress("正在處理查詢", 0.2)
+                    update_progress("正在抓取數據", 0.25, source_type)
                     result = await process_user_question(
                         user_query=user_query,
                         selected_source=selected_cat,
@@ -196,14 +210,15 @@ async def main():
                         source_type=source_type,
                         analysis=analysis,
                         conversation_context=st.session_state.conversation_context,
-                        progress_callback=update_progress
+                        progress_callback=lambda msg, prog, details=None: update_progress(msg, 0.25 + prog * 0.30, source_type, details)
                     )
+                    update_progress("數據處理完成", 0.55, source_type)
                     st.session_state.thread_cache[cache_key] = {
                         "timestamp": time.time(),
                         "data": result
                     }
             else:
-                update_progress("正在處理查詢", 0.2)
+                update_progress("正在抓取數據", 0.25, source_type)
                 result = await process_user_question(
                     user_query=user_query,
                     selected_source=selected_cat,
@@ -211,8 +226,9 @@ async def main():
                     source_type=source_type,
                     analysis=analysis,
                     conversation_context=st.session_state.conversation_context,
-                    progress_callback=update_progress
+                    progress_callback=lambda msg, prog, details=None: update_progress(msg, 0.25 + prog * 0.30, source_type, details)
                 )
+                update_progress("數據處理完成", 0.55, source_type)
                 st.session_state.thread_cache[cache_key] = {
                     "timestamp": time.time(),
                     "data": result
@@ -225,7 +241,7 @@ async def main():
                     grok_container = st.empty()
                 with col2:
                     copy_container = st.empty()
-                update_progress("正在生成回應", 0.9)
+                update_progress("正在生成回應", 0.85)
                 logger.info(f"Starting stream_grok3_response for query: {user_query}, intent: {analysis.get('intent')}")
                 async for chunk in stream_grok3_response(
                     user_query=user_query,
