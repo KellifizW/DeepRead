@@ -72,16 +72,15 @@ def clean_cache(cache, cache_type="topic"):
     expired_keys = [key for key, value in cache.items() if current_time - value["timestamp"] > CACHE_DURATION]
     for key in expired_keys:
         del cache[key]
-    # 限制緩存大小
     if len(cache) > MAX_CACHE_SIZE:
         sorted_keys = sorted(cache.items(), key=lambda x: x[1]["timestamp"])
         for key, _ in sorted_keys[:len(cache) - MAX_CACHE_SIZE]:
             del cache[key]
         logger.info(f"清理 {cache_type} 緩存，移除 {len(sorted_keys[:len(cache) - MAX_CACHE_SIZE])} 個過舊條目，當前緩存大小：{len(cache)}")
 
-async def get_reddit_topic_list(subreddit, start_page=1, max_pages=1, reddit=None):
+async def get_reddit_topic_list(subreddit, start_page=1, max_pages=1, sort="best", reddit=None):
     global request_counter, last_reset, topic_cache
-    cache_key = f"{subreddit}_{start_page}_{max_pages}"
+    cache_key = f"{subreddit}_{start_page}_{max_pages}_{sort}"
     
     clean_cache(topic_cache, "topic")
     if cache_key in topic_cache:
@@ -94,7 +93,7 @@ async def get_reddit_topic_list(subreddit, start_page=1, max_pages=1, reddit=Non
         reddit = await init_reddit_client()
     items = []
     rate_limit_info = []
-    local_last_reset = last_reset  # 保存全局 last_reset 的當前值
+    local_last_reset = last_reset
     
     try:
         total_limit = 100
@@ -107,23 +106,41 @@ async def get_reddit_topic_list(subreddit, start_page=1, max_pages=1, reddit=Non
                 await asyncio.sleep(wait_time)
                 request_counter = 0
                 local_last_reset = time.time()
-                last_reset = local_last_reset  # 更新全局 last_reset
+                last_reset = local_last_reset
                 logger.info("速率限制計數器重置")
         
-        logger.info(f"開始抓取子版 {subreddit}，當前請求次數 {request_counter}")
+        logger.info(f"開始抓取子版 {subreddit}，排序：{sort}，當前請求次數 {request_counter}")
         
-        async for submission in subreddit_obj.new(limit=total_limit):
-            if submission.created_utc:
-                hk_time = datetime.fromtimestamp(submission.created_utc, tz=HONG_KONG_TZ)
-                readable_time = hk_time.strftime("%Y-%m-%d %H:%M:%S")
-                item = {
-                    "thread_id": submission.id,
-                    "title": submission.title,
-                    "no_of_reply": submission.num_comments,
-                    "last_reply_time": readable_time,
-                    "like_count": submission.score
-                }
-                items.append(item)
+        if sort not in ["best", "new"]:
+            raise ValueError(f"不支持的排序方式：{sort}，僅支援 'best' 或 'new'")
+        
+        if sort == "best":
+            async for submission in subreddit_obj.top(time_filter="day", limit=total_limit):
+                if submission.created_utc:
+                    hk_time = datetime.fromtimestamp(submission.created_utc, tz=HONG_KONG_TZ)
+                    readable_time = hk_time.strftime("%Y-%m-%d %H:%M:%S")
+                    item = {
+                        "thread_id": submission.id,
+                        "title": submission.title,
+                        "no_of_reply": submission.num_comments,
+                        "last_reply_time": readable_time,
+                        "like_count": submission.score
+                    }
+                    items.append(item)
+        elif sort == "new":
+            async for submission in subreddit_obj.new(limit=total_limit):
+                if submission.created_utc:
+                    hk_time = datetime.fromtimestamp(submission.created_utc, tz=HONG_KONG_TZ)
+                    readable_time = hk_time.strftime("%Y-%m-%d %H:%M:%S")
+                    item = {
+                        "thread_id": submission.id,
+                        "title": submission.title,
+                        "no_of_reply": submission.num_comments,
+                        "last_reply_time": readable_time,
+                        "like_count": submission.score
+                    }
+                    items.append(item)
+        
         logger.info(f"抓取子版 {subreddit} 成功，總項目數 {len(items)}")
         
         topic_cache[cache_key] = {
@@ -158,6 +175,63 @@ async def get_reddit_topic_list(subreddit, start_page=1, max_pages=1, reddit=Non
         "rate_limit_until": 0
     }
 
+async def collect_more_comments(reddit, submission, max_comments, request_counter, local_last_reset):
+    """收集 MoreComments 的 children ID，分批調用 /api/morechildren"""
+    more_comments_ids = []
+    comments = []
+    
+    async for comment in submission.comments:
+        if isinstance(comment, asyncpraw.models.MoreComments):
+            more_comments_ids.extend(comment.children)
+        elif hasattr(comment, 'body') and comment.body:
+            hk_time = datetime.fromtimestamp(comment.created_utc, tz=HONG_KONG_TZ)
+            comments.append({
+                "reply_id": comment.id,
+                "msg": comment.body,
+                "like_count": comment.score,
+                "reply_time": hk_time.strftime("%Y-%m-%d %H:%M:%S")
+            })
+    
+    BATCH_SIZE = 100
+    for i in range(0, len(more_comments_ids), BATCH_SIZE):
+        if len(comments) >= max_comments:
+            break
+        batch_ids = more_comments_ids[i:i + BATCH_SIZE]
+        if not batch_ids:
+            continue
+        
+        if request_counter >= RATE_LIMIT_REQUESTS_PER_MINUTE:
+            wait_time = 60 - (time.time() - local_last_reset)
+            if wait_time > 0:
+                logger.warning(f"達到速率限制，等待 {wait_time:.2f} 秒")
+                await asyncio.sleep(wait_time)
+                request_counter = 0
+                local_last_reset = time.time()
+        
+        try:
+            more_comments = await reddit.comment.more_children(
+                link_id=f"t3_{submission.id}",
+                children=",".join(batch_ids),
+                sort="best"
+            )
+            request_counter += 1
+            for comment in more_comments:
+                if hasattr(comment, 'body') and comment.body:
+                    hk_time = datetime.fromtimestamp(comment.created_utc, tz=HONG_KONG_TZ)
+                    comments.append({
+                        "reply_id": comment.id,
+                        "msg": comment.body,
+                        "like_count": comment.score,
+                        "reply_time": hk_time.strftime("%Y-%m-%d %H:%M:%S")
+                    })
+                    if len(comments) >= max_comments:
+                        break
+        except Exception as e:
+            logger.warning(f"/api/morechildren 請求失敗：{str(e)}")
+            continue
+    
+    return comments[:max_comments], request_counter, local_last_reset
+
 async def get_reddit_thread_content(post_id, subreddit, max_comments=100, reddit=None):
     global request_counter, last_reset, thread_cache
     cache_key = f"{post_id}_subreddit_{subreddit}_{max_comments}"
@@ -177,7 +251,7 @@ async def get_reddit_thread_content(post_id, subreddit, max_comments=100, reddit
     
     replies = []
     rate_limit_info = []
-    local_last_reset = last_reset  # 保存全局 last_reset 的當前值
+    local_last_reset = last_reset
     
     try:
         request_counter += 1
@@ -188,7 +262,7 @@ async def get_reddit_thread_content(post_id, subreddit, max_comments=100, reddit
                 await asyncio.sleep(wait_time)
                 request_counter = 0
                 local_last_reset = time.time()
-                last_reset = local_last_reset  # 更新全局 last_reset
+                last_reset = local_last_reset
                 logger.info("速率限制計數器重置")
         
         logger.info(f"開始抓取貼文：[{post_id}]，當前請求次數：{request_counter}")
@@ -210,40 +284,14 @@ async def get_reddit_thread_content(post_id, subreddit, max_comments=100, reddit
                 "rate_limit_until": 0
             }
         
-        # 在 follow_up 意圖下（max_comments>=200）展開 MoreComments
-        if max_comments >= 200:
-            await submission.comments.replace_more(limit=None)
-        else:
-            await submission.comments.replace_more(limit=0)  # 默認不展開 MoreComments
-        
         title = submission.title
         total_replies = submission.num_comments
         like_count = submission.score
         last_reply_time = datetime.fromtimestamp(submission.created_utc, tz=HONG_KONG_TZ).strftime("%Y-%m-%d %H:%M:%S")
         
-        comment_count = 0
-        async for comment in submission.comments:
-            if comment_count >= max_comments:
-                break
-            if hasattr(comment, 'body') and comment.body:
-                hk_time = datetime.fromtimestamp(comment.created_utc, tz=HONG_KONG_TZ)
-                replies.append({
-                    "reply_id": comment.id,
-                    "msg": comment.body,
-                    "like_count": comment.score,
-                    "reply_time": hk_time.strftime("%Y-%m-%d %H:%M:%S")
-                })
-                comment_count += 1
-                request_counter += 1
-                if request_counter >= RATE_LIMIT_REQUESTS_PER_MINUTE:
-                    wait_time = 60 - (time.time() - local_last_reset)
-                    if wait_time > 0:
-                        logger.warning(f"達到速率限制，等待 {wait_time:.2f} 秒")
-                        await asyncio.sleep(wait_time)
-                        request_counter = 0
-                        local_last_reset = time.time()
-                        last_reset = local_last_reset
-                        logger.info("速率限制計數器重置")
+        replies, request_counter, local_last_reset = await collect_more_comments(
+            reddit, submission, max_comments, request_counter, local_last_reset
+        )
         
         logger.info(f"抓取貼文完成：{{{post_id}: {len(replies)}}}，總回覆數：{len(replies)}")
         
@@ -299,7 +347,7 @@ async def get_reddit_thread_content_batch(post_ids, subreddit, max_comments=100)
     results = []
     rate_limit_info = []
     local_last_reset = last_reset
-    fetch_status = {}  # 記錄每個貼文的抓取結果
+    fetch_status = {}
     
     reddit = await init_reddit_client()
     try:
@@ -346,41 +394,14 @@ async def get_reddit_thread_content_batch(post_ids, subreddit, max_comments=100)
                 fetch_status[post_id] = {"status": "failed", "replies": 0}
                 continue
             
-            # 在 follow_up 意圖下（max_comments>=200）展開 MoreComments
-            if max_comments >= 200:
-                await submission.comments.replace_more(limit=None)
-            else:
-                await submission.comments.replace_more(limit=0)  # 默認不展開 MoreComments
-            
             title = submission.title
             total_replies = submission.num_comments
             like_count = submission.score
             last_reply_time = datetime.fromtimestamp(submission.created_utc, tz=HONG_KONG_TZ).strftime("%Y-%m-%d %H:%M:%S")
-            replies = []
             
-            comment_count = 0
-            async for comment in submission.comments:
-                if comment_count >= max_comments:
-                    break
-                if hasattr(comment, 'body') and comment.body:
-                    hk_time = datetime.fromtimestamp(comment.created_utc, tz=HONG_KONG_TZ)
-                    replies.append({
-                        "reply_id": comment.id,
-                        "msg": comment.body,
-                        "like_count": comment.score,
-                        "reply_time": hk_time.strftime("%Y-%m-%d %H:%M:%S")
-                    })
-                    comment_count += 1
-                    request_counter += 1
-                    if request_counter >= RATE_LIMIT_REQUESTS_PER_MINUTE:
-                        wait_time = 60 - (time.time() - local_last_reset)
-                        if wait_time > 0:
-                            logger.warning(f"達到速率限制，等待 {wait_time:.2f} 秒")
-                            await asyncio.sleep(wait_time)
-                            request_counter = 0
-                            local_last_reset = time.time()
-                            last_reset = local_last_reset
-                            logger.info("速率限制計數器重置")
+            replies, request_counter, local_last_reset = await collect_more_comments(
+                reddit, submission, max_comments, request_counter, local_last_reset
+            )
             
             result = {
                 "title": title,

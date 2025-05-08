@@ -11,12 +11,13 @@ from lihkg_api import get_lihkg_topic_list, get_lihkg_thread_content
 from reddit_api import get_reddit_topic_list, get_reddit_thread_content
 from logging_config import configure_logger
 from dynamic_prompt_utils import build_dynamic_prompt, parse_query, extract_keywords, CONFIG
+import traceback
 
 HONG_KONG_TZ = pytz.timezone("Asia/Hong_Kong")
 logger = configure_logger(__name__, "grok_processing.log")
 GROK3_API_URL = "https://api.x.ai/v1/chat/completions"
 GROK3_TOKEN_LIMIT = 120000
-API_TIMEOUT = 90
+API_TIMEOUT = 120  # Increased timeout for large prompts
 MAX_CACHE_SIZE = 100
 
 cache_lock = asyncio.Lock()
@@ -312,8 +313,22 @@ async def stream_grok3_response(user_query, metadata, thread_data, processing, s
     conversation_context = conversation_context or []
     filters = filters or {"min_replies": 10, "min_likes": 0}
     
+    # 確保 selected_source 是字典格式
+    if isinstance(selected_source, str):
+        selected_source = {"source_name": selected_source, "source_type": source_type}
+        logger.debug(f"將字符串 selected_source 轉換為字典：{selected_source}")
+    elif not isinstance(selected_source, dict):
+        logger.warning(f"無效的 selected_source 類型：{type(selected_source)}，使用默認值")
+        selected_source = {"source_name": "未知", "source_type": source_type}
+    elif "source_name" not in selected_source or "source_type" not in selected_source:
+        logger.warning(f"selected_source 缺少必要字段：{selected_source}，補充默認值")
+        selected_source = {
+            "source_name": selected_source.get("source_name", "未知"),
+            "source_type": selected_source.get("source_type", source_type)
+        }
+    
     if not thread_data:
-        error_msg = f"在 {selected_source.get('source_name', '未知')} 中未找到符合條件的帖子（篩選：{json.dumps(filters, ensure_ascii=False)}）。建議嘗試其他關鍵詞或討論區！"
+        error_msg = f"在 {selected_source['source_name']} 中未找到符合條件的帖子（篩選：{json.dumps(filters, ensure_ascii=False)}）。建議嘗試其他關鍵詞或討論區！"
         logger.warning(f"無匹配帖子：{error_msg}")
         yield error_msg
         return
@@ -323,7 +338,6 @@ async def stream_grok3_response(user_query, metadata, thread_data, processing, s
         yield f"錯誤：無效的處理數據格式（{type(processing)}）。請聯繫支持。"
         return
     
-    # 提取意圖，優先從 analysis 中獲取完整的意圖資訊
     intents_info = []
     if processing.get('analysis') and processing['analysis'].get('intents'):
         intents_info = processing['analysis']['intents']
@@ -334,7 +348,7 @@ async def stream_grok3_response(user_query, metadata, thread_data, processing, s
         intents_info = [{"intent": "summarize_posts", "confidence": 0.7, "reason": "無有效意圖，默認總結"}]
     
     intents = [i['intent'] for i in intents_info]
-    logger.info(f"Starting stream_grok3_response for query: {user_query}, intents: {intents}")
+    logger.info(f"Starting stream_grok3_response for query: {user_query}, intents: {intents}, source: {selected_source}")
 
     try:
         GROK3_API_KEY = st.secrets["grok3key"]
@@ -359,6 +373,11 @@ async def stream_grok3_response(user_query, metadata, thread_data, processing, s
     max_tokens = min(target_tokens + 500, max_tokens_limit)
     max_replies_per_thread = 300 if any(intent == "follow_up" for intent in intents) else 100
     max_comments = 300 if source_type == "reddit" and any(intent == "follow_up" for intent in intents) else 100
+
+    # Dynamically adjust max_replies_per_thread based on prompt size
+    if prompt_length > GROK3_TOKEN_LIMIT * 0.8:
+        max_replies_per_thread = max_replies_per_thread // 2
+        logger.debug(f"Prompt length {prompt_length} exceeds 80% of limit, reducing max_replies_per_thread to {max_replies_per_thread}")
 
     if any(intent == "list_titles" for intent in intents):
         max_replies_per_thread = 10
@@ -401,6 +420,7 @@ async def stream_grok3_response(user_query, metadata, thread_data, processing, s
                         )
                         result = json.loads(response_content)
                         max_replies_per_thread = min(result.get("replies_per_thread", 300 if any(intent == "follow_up" for intent in intents) else 200 if any(intent == "analyze_sentiment" for intent in intents) else 100), 500)
+                        logger.debug(f"選擇每帖子回覆數：{max_replies_per_thread}, 原因：{result.get('reason', '未提供')}")
                     else:
                         logger.warning(f"無法確定每帖子回覆數，狀態碼={status_code}")
         except Exception as e:
@@ -431,6 +451,8 @@ async def stream_grok3_response(user_query, metadata, thread_data, processing, s
         if not referenced_thread_ids and any(intent == "follow_up" for intent in intents):
             keyword_result = await extract_keywords(user_query, conversation_context, GROK3_API_KEY)
             theme_keywords = keyword_result["keywords"]
+            sort = "new" if keyword_result.get("time_sensitive", False) else "best"
+            logger.debug(f"追問無參考帖子，獲取補充帖子，排序：{sort}，關鍵詞：{theme_keywords}")
             async with request_semaphore:
                 if source_type == "lihkg":
                     supplemental_result = await get_lihkg_topic_list(
@@ -442,14 +464,20 @@ async def stream_grok3_response(user_query, metadata, thread_data, processing, s
                     supplemental_result = await get_reddit_topic_list(
                         subreddit=source_id,
                         start_page=1,
-                        max_pages=2
+                        max_pages=2,
+                        sort=sort
                     )
             supplemental_threads = supplemental_result.get("items", [])
+            if not supplemental_threads:
+                logger.warning(f"無法獲取補充帖子，來源：{source_id}，排序：{sort}")
+                yield f"錯誤：在 {selected_source['source_name']} 中未找到相關帖子。請嘗試其他關鍵詞！"
+                return
             filtered_supplemental = [
                 item for item in supplemental_threads
                 if any(kw.lower() in item["title"].lower() for kw in theme_keywords)
             ][:1]
             referenced_thread_ids = [str(item["thread_id"]) for item in filtered_supplemental]
+            logger.debug(f"獲取補充帖子：{referenced_thread_ids}")
         
         prioritized_thread_data = {tid: thread_data_dict[tid] for tid in map(str, referenced_thread_ids) if tid in thread_data_dict}
         supplemental_thread_data = {tid: data for tid, data in thread_data_dict.items() if tid not in map(str, referenced_thread_ids)}
@@ -471,6 +499,7 @@ async def stream_grok3_response(user_query, metadata, thread_data, processing, s
                 cleaned_msg = clean_html(r["msg"])
                 if len(cleaned_msg.strip()) <= 7 or cleaned_msg in ["[圖片]", "[無內容]", "[表情符號]"]:
                     continue
+                r["reply_time"] = unix_to_readable(r.get("reply_time", "0"), context=f"reply in thread {tid}")
                 filtered_replies.append(r)
             
             sorted_replies = sorted(
@@ -484,7 +513,7 @@ async def stream_grok3_response(user_query, metadata, thread_data, processing, s
                 "thread_id": data.get("thread_id", tid),
                 "title": data.get("title", ""),
                 "no_of_reply": data.get("no_of_reply", 0),
-                "last_reply_time": data.get("last_reply_time", 0),
+                "last_reply_time": unix_to_readable(data.get("last_reply_time", "0"), context=f"thread {tid}"),
                 "like_count": data.get("like_count", 0),
                 "dislike_count": data.get("dislike_count", 0) if source_type == "lihkg" else 0,
                 "replies": sorted_replies,
@@ -522,7 +551,7 @@ async def stream_grok3_response(user_query, metadata, thread_data, processing, s
                             "msg": clean_html(reply.get("msg", "[無內容]")),
                             "like_count": reply.get("like_count", 0),
                             "dislike_count": reply.get("dislike_count", 0) if source_type == "lihkg" else 0,
-                            "reply_time": reply.get("reply_time", "0")
+                            "reply_time": unix_to_readable(reply.get("reply_time", "0"), context=f"additional reply in thread {tid}")
                         }
                         for reply in content_result.get("replies", [])
                         if reply.get("msg") and clean_html(reply.get("msg")) not in ["[無內容]", "[圖片]", "[表情符號]"]
@@ -535,7 +564,7 @@ async def stream_grok3_response(user_query, metadata, thread_data, processing, s
                         "thread_id": data.get("thread_id", tid),
                         "title": data.get("title", ""),
                         "no_of_reply": total_replies,
-                        "last_reply_time": content_result.get("last_reply_time", data["last_reply_time"]),
+                        "last_reply_time": unix_to_readable(content_result.get("last_reply_time", data["last_reply_time"]), context=f"thread {tid}"),
                         "like_count": data.get("like_count", 0),
                         "dislike_count": data.get("dislike_count", 0) if source_type == "lihkg" else 0,
                         "replies": data.get("replies", []) + filtered_additional_replies,
@@ -556,7 +585,7 @@ async def stream_grok3_response(user_query, metadata, thread_data, processing, s
                 "thread_id": data["thread_id"],
                 "title": data["title"],
                 "no_of_reply": data.get("no_of_reply", 0),
-                "last_reply_time": data.get("last_reply_time", 0),
+                "last_reply_time": unix_to_readable(data.get("last_reply_time", "0"), context=f"thread {tid}"),
                 "like_count": data.get("like_count", 0),
                 "dislike_count": data.get("dislike_count", 0) if source_type == "lihkg" else 0,
                 "replies": [],
@@ -566,11 +595,9 @@ async def stream_grok3_response(user_query, metadata, thread_data, processing, s
         }
         total_replies_count = 0
     
-    # 選擇主要意圖（信心值最高者）
     primary_intent_info = max(intents_info, key=lambda x: x["confidence"]) if intents_info else {"intent": "summarize_posts", "confidence": 0.7}
     primary_intent = primary_intent_info["intent"]
     
-    # 生成單一提示，涵蓋所有意圖
     prompt = await build_dynamic_prompt(
         query=user_query,
         conversation_context=conversation_context,
@@ -588,11 +615,12 @@ async def stream_grok3_response(user_query, metadata, thread_data, processing, s
         f"生成提示：函數=stream_grok3_response, 查詢={user_query}, "
         f"提示長度={prompt_length} 字符, 估計 token={estimated_tokens}, "
         f"thread_data 帖子數={len(filtered_thread_data)}, 總回覆數={total_replies_count}, "
-        f"intents={intents}, 主要意圖={primary_intent}"
+        f"intents={intents}, 主要意圖={primary_intent}, source={selected_source}"
     )
     
-    if prompt_length > GROK3_TOKEN_LIMIT:
-        logger.warning(f"提示長度超過限制：初始長度={prompt_length} > {GROK3_TOKEN_LIMIT}，縮減數據")
+    # Aggressive prompt size reduction
+    reduction_attempts = 0
+    while prompt_length > GROK3_TOKEN_LIMIT * 0.9 and reduction_attempts < 3:
         max_replies_per_thread = max_replies_per_thread // 2
         total_replies_count = 0
         filtered_thread_data = {
@@ -600,7 +628,7 @@ async def stream_grok3_response(user_query, metadata, thread_data, processing, s
                 "thread_id": data["thread_id"],
                 "title": data["title"],
                 "no_of_reply": data.get("no_of_reply", 0),
-                "last_reply_time": data.get("last_reply_time", 0),
+                "last_reply_time": unix_to_readable(data.get("last_reply_time", "0"), context=f"thread {tid}"),
                 "like_count": data.get("like_count", 0),
                 "dislike_count": data.get("dislike_count", 0) if source_type == "lihkg" else 0,
                 "replies": data["replies"][:max_replies_per_thread],
@@ -622,14 +650,18 @@ async def stream_grok3_response(user_query, metadata, thread_data, processing, s
         prompt_length = len(prompt)
         estimated_tokens = prompt_length // 4
         logger.info(
-            f"縮減後提示：函數=stream_grok3_response, 查詢={user_query}, "
+            f"縮減後提示（嘗試 {reduction_attempts + 1}）：函數=stream_grok3_response, 查詢={user_query}, "
             f"提示長度={prompt_length} 字符, 估計 token={estimated_tokens}, "
             f"thread_data 帖子數={len(filtered_thread_data)}, 總回覆數={total_replies_count}, "
-            f"intents={intents}, 主要意圖={primary_intent}"
+            f"intents={intents}, 主要意圖={primary_intent}, source={selected_source}"
         )
-        target_tokens = total_min_tokens + (total_replies_count / 500) * (total_max_tokens - total_min_tokens) * 0.9
-        target_tokens = min(max(int(target_tokens), total_min_tokens), max_tokens_limit)
-    
+        reduction_attempts += 1
+
+    if prompt_length > GROK3_TOKEN_LIMIT:
+        logger.error(f"無法縮減提示至限制以下：最終長度={prompt_length} > {GROK3_TOKEN_LIMIT}")
+        yield f"錯誤：提示數據過大，無法生成回應。請縮減查詢範圍或聯繫支持。"
+        return
+
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {GROK3_API_KEY}"}
     response_content = ""
     prompt_tokens = 0
@@ -658,7 +690,7 @@ async def stream_grok3_response(user_query, metadata, thread_data, processing, s
             async with session.post(GROK3_API_URL, headers=headers, json=payload, timeout=API_TIMEOUT) as response:
                 status_code = response.status
                 if status_code != 200:
-                    logger.error(f"回應生成失敗：狀態碼={status_code}, 意圖={intents}")
+                    logger.error(f"回應生成失敗：狀態碼={status_code}, 意圖={intents}, source={selected_source}")
                     yield f"錯誤：生成回應失敗（狀態碼 {status_code}）。請稍後重試。"
                     return
                 
@@ -670,7 +702,7 @@ async def stream_grok3_response(user_query, metadata, thread_data, processing, s
                                 f"Grok3 API 調用：函數=stream_grok3_response, "
                                 f"查詢={user_query}, 意圖={intents}, 狀態碼={status_code}, "
                                 f"輸入 token={prompt_tokens}, 輸出 token={completion_tokens}, "
-                                f"回應長度={len(response_content)}"
+                                f"回應長度={len(response_content)}, source={selected_source}"
                             )
                             break
                         if line_str.startswith("data:"):
@@ -689,10 +721,47 @@ async def stream_grok3_response(user_query, metadata, thread_data, processing, s
                                     prompt_tokens = usage.get("prompt_tokens", prompt_tokens)
                                     completion_tokens = usage.get("completion_tokens", completion_tokens)
                             except json.JSONDecodeError:
-                                logger.warning(f"流式數據 JSON 解碼錯誤")
+                                logger.warning(f"流式數據 JSON 解碼錯誤：{line_str}")
                                 continue
+        except aiohttp.ClientConnectionError as e:
+            logger.error(f"回應生成失敗：網絡連接錯誤，意圖={intents}, 錯誤={str(e)}, source={selected_source}, 堆棧={traceback.format_exc()}")
+            yield f"錯誤：網絡連接失敗（{str(e)}）。請檢查網絡或稍後重試。"
+        except aiohttp.ClientResponseError as e:
+            logger.error(f"回應生成失敗：API 響應錯誤，意圖={intents}, 錯誤={str(e)}, source={selected_source}, 堆棧={traceback.format_exc()}")
+            yield f"錯誤：API 響應錯誤（{str(e)}）。請稍後重試。"
+        except asyncio.TimeoutError as e:
+            logger.error(f"回應生成失敗：API 超時，意圖={intents}, 錯誤={str(e)}, source={selected_source}, 堆棧={traceback.format_exc()}")
+            # Fallback to non-streaming API call
+            logger.info(f"嘗試非流式 API 調用作為回退，max_tokens={max_tokens // 2}")
+            payload["stream"] = False
+            payload["max_tokens"] = max_tokens // 2
+            try:
+                async with session.post(GROK3_API_URL, headers=headers, json=payload, timeout=API_TIMEOUT) as response:
+                    status_code = response.status
+                    if status_code != 200:
+                        logger.error(f"非流式回退失敗：狀態碼={status_code}, 意圖={intents}, source={selected_source}")
+                        yield f"錯誤：生成回應失敗（狀態碼 {status_code}）。請稍後重試。"
+                        return
+                    data = await response.json()
+                    content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                    if content:
+                        cleaned_content = clean_response(content)
+                        response_content += cleaned_content
+                        yield cleaned_content
+                    usage = data.get("usage", {})
+                    prompt_tokens = usage.get("prompt_tokens", prompt_tokens)
+                    completion_tokens = usage.get("completion_tokens", completion_tokens)
+                    logger.info(
+                        f"非流式回退成功：函數=stream_grok3_response, "
+                        f"查詢={user_query}, 意圖={intents}, 狀態碼={status_code}, "
+                        f"輸入 token={prompt_tokens}, 輸出 token={completion_tokens}, "
+                        f"回應長度={len(response_content)}, source={selected_source}"
+                    )
+            except Exception as fallback_e:
+                logger.error(f"非流式回退失敗：意圖={intents}, 錯誤={str(fallback_e)}, source={selected_source}, 堆棧={traceback.format_exc()}")
+                yield f"錯誤：生成回應失敗（{str(fallback_e)}）。請稍後重試或聯繫支持。"
         except Exception as e:
-            logger.error(f"回應生成失敗：意圖={intents}, 錯誤={str(e)}")
+            logger.error(f"回應生成失敗：意圖={intents}, 錯誤={str(e)}, source={selected_source}, 堆棧={traceback.format_exc()}")
             yield f"錯誤：生成回應失敗（{str(e)}）。請稍後重試或聯繫支持。"
         finally:
             await session.close()
@@ -711,13 +780,27 @@ def clean_cache(max_age=3600):
             del st.session_state.thread_cache[key]
         logger.info(f"清理緩存，移除 {len(sorted_keys[:len(st.session_state.thread_cache) - MAX_CACHE_SIZE])} 個過舊條目，當前緩存大小：{len(st.session_state.thread_cache)}")
 
-def unix_to_readable(timestamp):
+def unix_to_readable(timestamp, context="unknown"):
     try:
-        timestamp = int(timestamp)
-        dt = datetime.datetime.fromtimestamp(timestamp, tz=HONG_KONG_TZ)
-        return dt.strftime("%Y-%m-%d %H:%M:%S")
-    except (ValueError, TypeError):
-        logger.warning(f"無法轉換時間戳 {timestamp}")
+        if isinstance(timestamp, (int, float)):
+            dt = datetime.datetime.fromtimestamp(timestamp, tz=HONG_KONG_TZ)
+            return dt.strftime("%Y-%m-%d %H:%M:%S")
+        elif isinstance(timestamp, str):
+            try:
+                timestamp_int = int(timestamp)
+                dt = datetime.datetime.fromtimestamp(timestamp_int, tz=HONG_KONG_TZ)
+                return dt.strftime("%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                try:
+                    dt = datetime.datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
+                    dt = HONG_KONG_TZ.localize(dt)
+                    return dt.strftime("%Y-%m-%d %H:%M:%S")
+                except ValueError:
+                    raise ValueError(f"無法解析日期字符串：{timestamp}")
+        else:
+            raise TypeError(f"無效的時間戳類型：{type(timestamp)}")
+    except (ValueError, TypeError) as e:
+        logger.warning(f"無法轉換時間戳：值={timestamp}, 類型={type(timestamp)}, 上下文={context}, 錯誤={str(e)}")
         return "1970-01-01 00:00:00"
 
 def configure_lihkg_api_logger():
@@ -737,9 +820,16 @@ async def process_user_question(user_query, selected_source, source_id, source_t
             "source_name": selected_source,
             "source_type": source_type
         }
+        logger.debug(f"將字符串 selected_source 轉換為字典：{selected_source}")
     elif not isinstance(selected_source, dict):
         logger.warning(f"無效的 selected_source 類型：{type(selected_source)}，使用默認值")
         selected_source = {"source_name": "未知", "source_type": source_type}
+    elif "source_name" not in selected_source or "source_type" not in selected_source:
+        logger.warning(f"selected_source 缺少必要字段：{selected_source}，補充默認值")
+        selected_source = {
+            "source_name": selected_source.get("source_name", "未知"),
+            "source_type": selected_source.get("source_type", source_type)
+        }
     
     try:
         clean_cache()
@@ -779,10 +869,12 @@ async def process_user_question(user_query, selected_source, source_id, source_t
         top_thread_ids = list(set(analysis.get("top_thread_ids", [])))
         intents = analysis.get("intents", [{"intent": "summarize_posts", "confidence": 0.7}])
         
-        logger.info(f"處理用戶問題：intents={[i['intent'] for i in intents]}, source_type={source_type}, source_id={source_id}, post_limit={post_limit}, top_thread_ids={top_thread_ids}")
+        logger.info(f"處理用戶問題：查詢={user_query}, intents={[i['intent'] for i in intents]}, source_type={source_type}, source_id={source_id}, post_limit={post_limit}, top_thread_ids={top_thread_ids}")
         
         keyword_result = await extract_keywords(user_query, conversation_context, GROK3_API_KEY)
         fetch_last_pages = 1 if keyword_result.get("time_sensitive", False) else 0
+        sort = "new" if keyword_result.get("time_sensitive", False) else "best"
+        logger.debug(f"選擇排序方式：{sort}，基於 time_sensitive={keyword_result.get('time_sensitive', False)}")
         
         max_comments = 300 if source_type == "reddit" and any(i["intent"] == "follow_up" for i in intents) else 100
         max_replies = 300 if any(i["intent"] in ["follow_up", "analyze_sentiment"] for i in intents) else 100
@@ -845,7 +937,7 @@ async def process_user_question(user_query, selected_source, source_id, source_t
                                 "msg": clean_html(reply.get("msg", "[無內容]")),
                                 "like_count": reply.get("like_count", 0),
                                 "dislike_count": reply.get("dislike_count", 0) if source_type == "lihkg" else 0,
-                                "reply_time": reply.get("reply_time", "0")
+                                "reply_time": unix_to_readable(reply.get("reply_time", "0"), context=f"reply in thread {thread_id}")
                             }
                             for reply in result.get("replies", [])
                             if reply.get("msg") and clean_html(reply.get("msg")) not in ["[無內容]", "[圖片]", "[表情符號]"]
@@ -855,7 +947,7 @@ async def process_user_question(user_query, selected_source, source_id, source_t
                             "thread_id": thread_id,
                             "title": result.get("title"),
                             "no_of_reply": total_replies,
-                            "last_reply_time": result.get("last_reply_time", "0"),
+                            "last_reply_time": unix_to_readable(result.get("last_reply_time", "0"), context=f"thread {thread_id}"),
                             "like_count": result.get("like_count", 0),
                             "dislike_count": result.get("dislike_count", 0) if source_type == "lihkg" else 0,
                             "replies": filtered_replies,
@@ -884,9 +976,21 @@ async def process_user_question(user_query, selected_source, source_id, source_t
                         supplemental_result = await get_reddit_topic_list(
                             subreddit=source_id,
                             start_page=1,
-                            max_pages=2
+                            max_pages=2,
+                            sort=sort
                         )
                 supplemental_threads = supplemental_result.get("items", [])
+                if not supplemental_threads:
+                    logger.warning(f"無法獲取補充帖子，來源：{source_id}，排序：{sort}")
+                    return {
+                        "selected_source": selected_source,
+                        "thread_data": thread_data,
+                        "rate_limit_info": rate_limit_info + [{"message": f"無法獲取補充帖子，來源：{source_id}"}],
+                        "request_counter": request_counter,
+                        "last_reset": last_reset,
+                        "rate_limit_until": rate_limit_until,
+                        "analysis": analysis
+                    }
                 filtered_supplemental = [
                     item for item in supplemental_threads
                     if str(item["thread_id"]) not in top_thread_ids
@@ -942,7 +1046,7 @@ async def process_user_question(user_query, selected_source, source_id, source_t
                                     "msg": clean_html(reply.get("msg", "[無內容]")),
                                     "like_count": reply.get("like_count", 0),
                                     "dislike_count": reply.get("dislike_count", 0) if source_type == "lihkg" else 0,
-                                    "reply_time": reply.get("reply_time", "0")
+                                    "reply_time": unix_to_readable(reply.get("reply_time", "0"), context=f"supplemental reply in thread {thread_id}")
                                 }
                                 for reply in result.get("replies", [])
                                 if reply.get("msg") and clean_html(reply.get("msg")) not in ["[無內容]", "[圖片]", "[表情符號]"]
@@ -952,7 +1056,7 @@ async def process_user_question(user_query, selected_source, source_id, source_t
                                 "thread_id": thread_id,
                                 "title": result.get("title"),
                                 "no_of_reply": total_replies,
-                                "last_reply_time": result.get("last_reply_time", "0"),
+                                "last_reply_time": unix_to_readable(result.get("last_reply_time", "0"), context=f"thread {thread_id}"),
                                 "like_count": filtered_supplemental[idx].get("like_count", 0),
                                 "dislike_count": filtered_supplemental[idx].get("dislike_count", 0) if source_type == "lihkg" else 0,
                                 "replies": filtered_replies,
@@ -1004,7 +1108,8 @@ async def process_user_question(user_query, selected_source, source_id, source_t
                         result = await get_reddit_topic_list(
                             subreddit=source_id,
                             start_page=page,
-                            max_pages=1
+                            max_pages=1,
+                            sort=sort
                         )
                 request_counter = result.get("request_counter", request_counter)
                 last_reset = result.get("last_reset", last_reset)
@@ -1013,7 +1118,7 @@ async def process_user_question(user_query, selected_source, source_id, source_t
                 items = result.get("items", [])
                 initial_threads.extend(items)
                 if not items:
-                    logger.warning(f"未抓取到分類 ID={source_id}，頁面={page} 的帖子")
+                    logger.warning(f"未抓取到分類 ID={source_id}，頁面={page} 的帖子，排序={sort}")
                 if len(initial_threads) >= 150:
                     initial_threads = initial_threads[:150]
                     break
@@ -1033,7 +1138,7 @@ async def process_user_question(user_query, selected_source, source_id, source_t
                             "thread_id": thread_id,
                             "title": item["title"],
                             "no_of_reply": item.get("no_of_reply", 0),
-                            "last_reply_time": item.get("last_reply_time", "0"),
+                            "last_reply_time": unix_to_readable(item.get("last_reply_time", "0"), context=f"thread {thread_id}"),
                             "like_count": item.get("like_count", 0),
                             "dislike_count": item.get("dislike_count", 0) if source_type == "lihkg" else 0,
                             "replies": [],
@@ -1125,7 +1230,7 @@ async def process_user_question(user_query, selected_source, source_id, source_t
                             "msg": clean_html(reply.get("msg", "[無內容]")),
                             "like_count": reply.get("like_count", 0),
                             "dislike_count": reply.get("dislike_count", 0) if source_type == "lihkg" else 0,
-                            "reply_time": reply.get("reply_time", "0")
+                            "reply_time": unix_to_readable(reply.get("reply_time", "0"), context=f"reply in thread {thread_id}")
                         }
                         for reply in result.get("replies", [])
                         if reply.get("msg") and clean_html(reply.get("msg")) not in ["[無內容]", "[圖片]", "[表情符號]"]
@@ -1135,7 +1240,7 @@ async def process_user_question(user_query, selected_source, source_id, source_t
                         "thread_id": thread_id,
                         "title": result.get("title"),
                         "no_of_reply": total_replies,
-                        "last_reply_time": result.get("last_reply_time", "0"),
+                        "last_reply_time": unix_to_readable(result.get("last_reply_time", "0"), context=f"thread {thread_id}"),
                         "like_count": candidate_threads[idx].get("like_count", 0),
                         "dislike_count": candidate_threads[idx].get("dislike_count", 0) if source_type == "lihkg" else 0,
                         "replies": filtered_replies,
@@ -1153,7 +1258,7 @@ async def process_user_question(user_query, selected_source, source_id, source_t
             progress_callback("正在準備數據", 0.5)
         
         logger.info(
-            f"最終 thread_data：{[{'thread_id': data['thread_id'], 'replies_count': len(data['replies'])} for data in thread_data]}"
+            f"最終 thread_data：{[{'thread_id': data['thread_id'], 'replies_count': len(data['replies'])} for data in thread_data]}, source={selected_source}"
         )
         
         return {
@@ -1167,7 +1272,7 @@ async def process_user_question(user_query, selected_source, source_id, source_t
         }
     
     except Exception as e:
-        logger.error(f"處理用戶問題失敗：{str(e)}")
+        logger.error(f"處理用戶問題失敗：查詢={user_query}, 錯誤={str(e)}, source={selected_source}, 堆棧={traceback.format_exc()}")
         return {
             "selected_source": selected_source,
             "thread_data": [],
