@@ -3,6 +3,7 @@ aiohttp
 nest_asyncio
 pytz
 tzlocal
-nltk
-praw
 asyncpraw
+pydantic
+Jinja2
+tenacity
