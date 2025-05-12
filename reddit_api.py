@@ -124,8 +124,8 @@ async def get_reddit_topic_list(subreddit, start_page=1, max_pages=1, sort="conf
     async with client_manager.get_client() as reddit:
         items = []
         rate_limit_info = []
-        total_limit = 100
-        items_per_page = 25
+        total_limit = 200
+        items_per_page = 100
         start_index = (start_page - 1) * items_per_page
         end_index = start_index + (max_pages * items_per_page)
         
