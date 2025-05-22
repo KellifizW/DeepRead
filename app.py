@@ -95,16 +95,12 @@ async def main():
     st.set_page_config(page_title="社交媒體聊天機器人", layout="centered")
     st.title("社交媒體聊天機器人")
 
-    # 初始化會話狀態
     for key, default in [
         ("chat_history", []), ("thread_cache", {}), ("awaiting_response", False),
         ("conversation_context", []), ("context_timestamps", []), ("last_selected_source", None)
     ]:
         if key not in st.session_state:
             st.session_state[key] = default
-    if not st.session_state.get("page_reload_logged", False):
-        st.session_state.page_reload_logged = True
-        logger.info(f"頁面重新加載，上次來源：{st.session_state.get('last_selected_source', '無')}")
 
     source_map = {
         "LIHKG - 吹水台": {"source": "lihkg", "cat_id": "1"}, "LIHKG - 熱門台": {"source": "lihkg", "cat_id": "2"},

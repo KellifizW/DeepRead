@@ -10,12 +10,12 @@ import pytz
 from lihkg_api import get_lihkg_topic_list, get_lihkg_thread_content
 from reddit_api import get_reddit_topic_list, get_reddit_thread_content
 from logging_config import configure_logger
-from dynamic_prompt_utils import build_dynamic_prompt, parse_query, extract_keywords, CONFIG, INTENT_CONFIG, get_intent_processing_params
+from dynamic_prompt_utils import build_dynamic_prompt, parse_query, extract_keywords, CONFIG, INTENT_CONFIG
 
 HONG_KONG_TZ = pytz.timezone("Asia/Hong_Kong")
 logger = configure_logger(__name__, "grok_processing.log")
 GROK3_API_URL = "https://api.x.ai/v1/chat/completions"
-GROK3_TOKEN_LIMIT = 190000
+GROK3_TOKEN_LIMIT = 270000
 API_TIMEOUT = 120
 MAX_CACHE_SIZE = 100
 
@@ -140,7 +140,13 @@ async def analyze_and_screen(user_query, source_name, source_id, source_type="li
     theme = historical_theme if is_vague else (query_keywords[0] if query_keywords else "一般")
     theme_keywords = historical_keywords if is_vague else query_keywords
     primary_intent = max(intents, key=lambda x: x["confidence"])["intent"]
-    intent_params = get_intent_processing_params(primary_intent, source_type)
+    # 內聯 get_intent_processing_params 邏輯
+    intent_params = INTENT_CONFIG.get(primary_intent, INTENT_CONFIG["summarize_posts"]).get("processing", {}).copy()
+    sort_override = intent_params.get("sort_override", {})
+    if source_type.lower() in sort_override:
+        intent_params["sort"] = sort_override[source_type.lower()]
+    if source_type.lower() == "lihkg" and intent_params.get("sort") == "confidence":
+        intent_params["sort"] = "hot"
     logger.info(f"動態 post_limit 來自 parse_query: {post_limit}, 意圖: {primary_intent}")
     return {
         "direct_response": primary_intent in ["general_query", "introduce"],
@@ -278,7 +284,13 @@ async def stream_grok3_response(user_query, metadata, thread_data, processing, s
         intents = ["summarize_posts"]
         logger.warning(f"無有效意圖，回退到：{intents}")
     primary_intent = max(intents_info, key=lambda x: x["confidence"])["intent"]
-    intent_params = get_intent_processing_params(primary_intent, source_type)
+    # 內聯 get_intent_processing_params 邏輯
+    intent_params = INTENT_CONFIG.get(primary_intent, INTENT_CONFIG["summarize_posts"]).get("processing", {}).copy()
+    sort_override = intent_params.get("sort_override", {})
+    if source_type.lower() in sort_override:
+        intent_params["sort"] = sort_override[source_type.lower()]
+    if source_type.lower() == "lihkg" and intent_params.get("sort") == "confidence":
+        intent_params["sort"] = "hot"
     logger.info(f"開始生成回應：查詢={user_query}, 意圖={intents}, 來源={selected_source}")
     total_min_tokens = sum(INTENT_CONFIG.get(intent, INTENT_CONFIG["summarize_posts"])["word_range"][0] / 0.8 for intent in intents)
     total_max_tokens = sum(INTENT_CONFIG.get(intent, INTENT_CONFIG["summarize_posts"])["word_range"][1] / 0.8 for intent in intents)
@@ -396,7 +408,7 @@ async def stream_grok3_response(user_query, metadata, thread_data, processing, s
             except (aiohttp.ClientConnectionError, aiohttp.ClientResponseError, asyncio.TimeoutError) as e:
                 logger.error(f"流式 API 錯誤：{str(e)}, 嘗試={attempt + 1}")
                 if attempt < 1:
-                    asyncio.sleep(2)
+                    await asyncio.sleep(2)
                     continue
                 logger.info(f"回退到非流式 API，max_tokens={max_tokens // 2}")
                 payload["stream"] = False
@@ -450,11 +462,16 @@ async def process_user_question(user_query, selected_source, source_id, source_t
         }
     analysis = analysis or await analyze_and_screen(user_query, selected_source["source_name"], source_id, source_type, conversation_context)
     primary_intent = max(analysis.get("intents", [{"intent": "summarize_posts", "confidence": 0.7}]), key=lambda x: x["confidence"])["intent"]
-    intent_params = get_intent_processing_params(primary_intent, source_type)
+    # 內聯 get_intent_processing_params 邏輯
+    intent_params = INTENT_CONFIG.get(primary_intent, INTENT_CONFIG["summarize_posts"]).get("processing", {}).copy()
+    sort_override = intent_params.get("sort_override", {})
+    if source_type.lower() in sort_override:
+        sort = intent_params["sort"] = sort_override[source_type.lower()]
+    if source_type.lower() == "lihkg" and intent_params.get("sort") == "confidence":
+        sort = intent_params["sort"] = "hot"
     post_limit = max(3, min(15, analysis.get("post_limit", 5)))  # 確保 post_limit 在 3 到 15
     top_thread_ids = list(set(analysis.get("top_thread_ids", [])))
     keyword_result = await extract_keywords(user_query, conversation_context, api_key, source_type)
-    sort = intent_params.get("sort", "hot")
     max_replies = intent_params.get("max_replies", 100)
     max_comments = intent_params.get("max_replies", 100) if source_type == "reddit" else 100
     thread_data = []
@@ -669,7 +686,7 @@ async def process_user_question(user_query, selected_source, source_id, source_t
                                 "dislike_count": reply.get("dislike_count", 0) if source_type == "lihkg" else 0,
                                 "reply_time": unix_to_readable(reply.get("reply_time", "0"), context=f"supplemental reply in thread {thread_id}"),
                             }
-                            for reply in result.get("replies", [])
+                            for reply in result.get("replies", []) 
                             if reply.get("msg") and clean_html(reply.get("msg")) not in ["[無內容]", "[圖片]", "[表情符號]"] and len(clean_html(reply.get("msg")).strip()) > 7
                         ]
                         total_replies = result.get("total_replies", item.get("no_of_reply", 0))
@@ -697,6 +714,7 @@ async def process_user_question(user_query, selected_source, source_id, source_t
             "thread_data": thread_data,
             "rate_limit_info": rate_limit_info,
             "request_counter": request_counter,
+            " humanities": [],
             "last_reset": last_reset,
             "rate_limit_until": rate_limit_until,
             "analysis": analysis,
