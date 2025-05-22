@@ -3,10 +3,9 @@ import asyncio
 import json
 import logging
 import re
+from logging_config import configure_logger
 import streamlit as st
 from typing import Dict, List, Optional, Tuple
-import openai
-from logging_config import configure_logger
 
 logger = configure_logger(__name__, "dynamic_prompt_utils.log")
 GROK3_API_URL = "https://api.x.ai/v1/chat/completions"
@@ -238,128 +237,45 @@ CONFIG = {
     "intent_confidence_threshold": 0.75
 }
 
-class AIClient:
-    """Unified client for managing Grok and ChatAnywhere API calls"""
-    
-    def __init__(self, api_type: str, api_key: str, base_url: str = None):
-        self.api_type = api_type.lower()
-        self.api_key = api_key
-        self.base_url = base_url
-        self.client = None
-        self.rate_limit_info = []
-        self.setup_client()
-
-    def setup_client(self):
-        if self.api_type == "grok":
-            self.client = aiohttp.ClientSession(headers={"Authorization": f"Bearer {self.api_key}"})
-        elif self.api_type == "chatanywhere":
-            self.client = openai.AsyncOpenAI(
-                api_key=self.api_key,
-                base_url=self.base_url or "https://api.chatanywhere.tech/v1"
-            )
-        else:
-            raise ValueError(f"Unsupported API type: {self.api_type}")
-
-    async def check_rate_limit(self) -> bool:
-        if self.api_type != "chatanywhere":
-            return True
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get("https://status.chatanywhere.tech") as response:
-                    if response.status == 200:
-                        status = await response.json()
-                        if status.get("requests_remaining", 0) <= 0:
-                            self.rate_limit_info.append({"message": "ChatAnywhere API rate limit reached"})
-                            logger.warning("ChatAnywhere API rate limit reached")
-                            return False
-                        return True
-                    return True
-        except Exception as e:
-            logger.error(f"Rate limit check failed: {str(e)}")
-            return True
-
-    async def call_api(self, messages: List[dict], model: str = None, max_tokens: int = 3000, temperature: float = 0.7, stream: bool = False):
-        if self.api_type == "chatanywhere" and not await self.check_rate_limit():
-            self.rate_limit_info.append({"message": "ChatAnywhere daily request limit reached"})
-            return {"error": "ChatAnywhere daily request limit reached"}
-        
-        try:
-            if self.api_type == "grok":
-                payload = {
-                    "model": "grok-3",
-                    "messages": messages,
-                    "max_tokens": max_tokens,
-                    "temperature": temperature,
-                    "stream": stream
-                }
-                async with self.client.post(GROK3_API_URL, json=payload, timeout=CONFIG["parse_timeout"]) as response:
-                    if response.status != 200:
-                        self.rate_limit_info.append({"message": f"Grok API error: HTTP {response.status}"})
-                        logger.error(f"Grok API error: {await response.text()}")
-                        return {"error": f"HTTP {response.status}"}
-                    if stream:
-                        return response
-                    return await response.json()
-            
-            elif self.api_type == "chatanywhere":
-                if not model:
-                    model = "gpt-3.5-turbo"
-                if stream:
-                    response = await self.client.chat.completions.create(
-                        model=model,
-                        messages=messages,
-                        max_tokens=max_tokens,
-                        temperature=temperature,
-                        stream=True
-                    )
-                    return response
-                else:
-                    response = await self.client.chat.completions.create(
-                        model=model,
-                        messages=messages,
-                        max_tokens=max_tokens,
-                        temperature=temperature
-                    )
-                    return {
-                        "choices": [{"message": {"content": response.choices[0].message.content}}],
-                        "usage": {"prompt_tokens": response.usage.prompt_tokens, "completion_tokens": response.usage.completion_tokens}
-                    }
-        
-        except Exception as e:
-            self.rate_limit_info.append({"message": f"{self.api_type} API error: {str(e)}"})
-            logger.error(f"{self.api_type} API error: {str(e)}", exc_info=True)
-            return {"error": str(e)}
-
-    async def close(self):
-        if self.api_type == "grok" and self.client:
-            await self.client.close()
-
-async def call_ai_api(api_type: str, api_key: str, messages: List[dict], base_url: str = None, model: str = None, max_tokens: int = 3000, temperature: float = 0.7, stream: bool = False):
-    client = AIClient(api_type, api_key, base_url)
-    for attempt in range(CONFIG["max_parse_retries"]):
-        try:
-            result = await client.call_api(messages, model, max_tokens, temperature, stream)
-            if stream:
-                return result, client.rate_limit_info
-            await client.close()
-            return result
-        except Exception as e:
-            logger.warning(f"API call failed (attempt {attempt+1}): {str(e)}")
-            if attempt == CONFIG["max_parse_retries"] - 1:
-                await client.close()
-                return {"error": f"API call failed: {str(e)}"}
-            await asyncio.sleep(2)
-    await client.close()
-    return {"error": "Unknown error"}
-
 async def call_grok3_api(payload: Dict, function_name: str = "unknown", retries: int = CONFIG["max_parse_retries"], timeout: int = CONFIG["parse_timeout"]) -> Optional[Dict]:
     """Unified Grok 3 API call handler with detailed logging and JSON fix."""
     try:
-        api_key = st.secrets["grok3key"]
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {st.secrets['grok3key']}"}
     except KeyError:
         logger.error(f"API call failed in {function_name}: Missing Grok 3 API key")
         return None
-    return await call_ai_api("grok", api_key, payload["messages"], max_tokens=payload.get("max_tokens", 3000), temperature=payload.get("temperature", 0.7))
+
+    async with aiohttp.ClientSession() as session:
+        for attempt in range(retries):
+            try:
+                async with session.post(GROK3_API_URL, headers=headers, json=payload, timeout=timeout) as response:
+                    if response.status != 200:
+                        logger.warning(f"API call failed in {function_name}: status={response.status}, attempt={attempt + 1}")
+                        if attempt < retries - 1:
+                            await asyncio.sleep(2)
+                        continue
+                    data = await response.json()
+                    if not data.get("choices"):
+                        logger.warning(f"API call failed in {function_name}: no choices, attempt={attempt + 1}")
+                        if attempt < retries - 1:
+                            await asyncio.sleep(2)
+                        continue
+                    logger.info(
+                        f"API call in {function_name}: status={response.status}, "
+                        f"prompt_tokens={data.get('usage', {}).get('prompt_tokens', 0)}, "
+                        f"completion_tokens={data.get('usage', {}).get('completion_tokens', 0)}"
+                    )
+                    return data
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                logger.error(f"API call error in {function_name}: {str(e)}, attempt={attempt + 1}")
+                if attempt < retries - 1:
+                    await asyncio.sleep(2)
+            except json.JSONDecodeError as e:
+                logger.error(f"API response JSON decode error in {function_name}: {str(e)}, attempt={attempt + 1}")
+                if attempt < retries - 1:
+                    await asyncio.sleep(2)
+    logger.warning(f"API call failed in {function_name} after {retries} attempts")
+    return None
 
 async def determine_post_limit(query: str, keywords: List[str], intents: List[Dict], source_type: str, grok3_api_key: str) -> int:
     """Determine dynamic post limit (3-15) based on query specificity."""
@@ -397,7 +313,7 @@ Output: {{"post_limit": number, "reason": "reason (max 70 chars)"}}
     logger.info(f"Fallback post_limit: 5, reason=API call failed")
     return 5
 
-async def parse_query(query: str, conversation_context: List[Dict], grok3_api_key: str, source_type: str = "lihkg", api_type: str = "grok", api_base_url: str = None) -> Dict:
+async def parse_query(query: str, conversation_context: List[Dict], grok3_api_key: str, source_type: str = "lihkg") -> Dict:
     """Parse query to extract intents, keywords, thread IDs, post_limit, and context summary."""
     if not isinstance(query, str):
         logger.error(f"Invalid query type: {type(query)}")
@@ -421,28 +337,23 @@ Summarize conversation history to identify user's query focus (e.g., topics, int
 History: {json.dumps(conversation_context, ensure_ascii=False)}
 Output: {{"summary": "brief summary (max 100 chars)", "reason": "summarization logic (max 70 chars)"}}
 """
-        try:
-            api_key = st.secrets["grok3key"] if api_type == "grok" else st.secrets["chatanywhere_key"]
-        except KeyError:
-            logger.error(f"Missing {'Grok 3' if api_type == 'grok' else 'ChatAnywhere'} API key")
-            context_summary = "Unable to summarize conversation history"
-        else:
-            messages = [{"role": "system", "content": "Conversation summarizer"}, {"role": "user", "content": prompt}]
-            api_response = await call_ai_api(api_type, api_key, messages, api_base_url, max_tokens=150, temperature=0.5)
-            if "error" not in api_response:
-                response_content = api_response["choices"][0]["message"]["content"]
-                try:
-                    result = json.loads(response_content)
-                    context_summary = result.get("summary", "")[:100]
-                    logger.info(f"Context summary generated: {context_summary}")
-                except json.JSONDecodeError:
-                    logger.warning(f"Failed to parse context summary: {response_content}")
-                    context_summary = "Unable to summarize conversation history"
-            else:
-                logger.warning(f"Context summary API call failed: {api_response['error']}")
+        payload = {
+            "model": "grok-3",
+            "messages": [{"role": "system", "content": "Conversation summarizer"}, {"role": "user", "content": prompt}],
+            "max_tokens": 150,
+            "temperature": 0.5
+        }
+        if api_response := await call_grok3_api(payload, "generate_context_summary"):
+            response_content = api_response["choices"][0]["message"]["content"]
+            try:
+                result = json.loads(response_content)
+                context_summary = result.get("summary", "")[:100]
+                logger.info(f"Context summary generated: {context_summary}")
+            except json.JSONDecodeError:
+                logger.warning(f"Failed to parse context summary: {response_content}")
                 context_summary = "Unable to summarize conversation history"
 
-    keyword_result = await extract_keywords(query, conversation_context, grok3_api_key, source_type, api_type, api_base_url)
+    keyword_result = await extract_keywords(query, conversation_context, grok3_api_key, source_type)
     keywords, time_sensitive = keyword_result.get("keywords", []), keyword_result.get("time_sensitive", False)
     intents, thread_ids, query_lower, reason = [], [], query.lower(), "Initial intent detection"
 
@@ -466,32 +377,30 @@ History: {json.dumps(conversation_context, ensure_ascii=False)}
 Source: {source_type}
 Output: {{"intents": [{{"intent": "intent", "confidence": 0.0-1.0, "reason": "reason"}}, ...], "reason": "overall reason"}}
 """
-        try:
-            api_key = st.secrets["grok3key"] if api_type == "grok" else st.secrets["chatanywhere_key"]
-        except KeyError:
-            logger.error(f"Missing {'Grok 3' if api_type == 'grok' else 'ChatAnywhere'} API key")
-            intents = [{"intent": "summarize_posts", "confidence": 0.7, "reason": "Missing API key"}]
+        payload = {
+            "model": "grok-3",
+            "messages": [{"role": "system", "content": "Semantic analysis assistant"}, *conversation_context, {"role": "user", "content": prompt}],
+            "max_tokens": 300,
+            "temperature": 0.5
+        }
+        if api_response := await call_grok3_api(payload, "parse_query"):
+            response_content = api_response["choices"][0]["message"]["content"]
+            try:
+                result = json.loads(response_content)
+                intents = [i for i in result.get("intents", []) if i["confidence"] >= CONFIG["intent_confidence_threshold"]]
+                reason = result.get("reason", "Semantic matching")
+            except json.JSONDecodeError:
+                if response_content.strip().endswith("..."):
+                    try:
+                        fixed_content = response_content.rsplit(",", 1)[0] + "]}"
+                        result = json.loads(fixed_content)
+                        intents = [i for i in result.get("intents", []) if i["confidence"] >= CONFIG["intent_confidence_threshold"]]
+                        reason = result.get("reason", "Fixed truncated JSON")
+                    except json.JSONDecodeError:
+                        logger.warning("Failed to fix truncated JSON in parse_query")
+                intents = [{"intent": "summarize_posts", "confidence": 0.7, "reason": "JSON parsing failed"}]
         else:
-            messages = [{"role": "system", "content": "Semantic analysis assistant"}, *conversation_context, {"role": "user", "content": prompt}]
-            api_response = await call_ai_api(api_type, api_key, messages, api_base_url, max_tokens=300, temperature=0.5)
-            if "error" not in api_response:
-                response_content = api_response["choices"][0]["message"]["content"]
-                try:
-                    result = json.loads(response_content)
-                    intents = [i for i in result.get("intents", []) if i["confidence"] >= CONFIG["intent_confidence_threshold"]]
-                    reason = result.get("reason", "Semantic matching")
-                except json.JSONDecodeError:
-                    if response_content.strip().endswith("..."):
-                        try:
-                            fixed_content = response_content.rsplit(",", 1)[0] + "]}"
-                            result = json.loads(fixed_content)
-                            intents = [i for i in result.get("intents", []) if i["confidence"] >= CONFIG["intent_confidence_threshold"]]
-                            reason = result.get("reason", "Fixed truncated JSON")
-                        except json.JSONDecodeError:
-                            logger.warning("Failed to fix truncated JSON in parse_query")
-                    intents = [{"intent": "summarize_posts", "confidence": 0.7, "reason": "JSON parsing failed"}]
-            else:
-                intents = [{"intent": "summarize_posts", "confidence": 0.7, "reason": f"API call failed: {api_response['error']}"}]
+            intents = [{"intent": "summarize_posts", "confidence": 0.7, "reason": "API call failed"}]
 
     if not intents:
         intents = [{"intent": "summarize_posts", "confidence": 0.7, "reason": "Default to summarization"}]
@@ -510,7 +419,7 @@ Output: {{"intents": [{{"intent": "intent", "confidence": 0.0-1.0, "reason": "re
         "context_summary": context_summary
     }
 
-async def extract_keywords(query: str, conversation_context: List[Dict], grok3_api_key: str, source_type: str = "lihkg", api_type: str = "grok", api_base_url: str = None) -> Dict:
+async def extract_keywords(query: str, conversation_context: List[Dict], grok3_api_key: str, source_type: str = "lihkg") -> Dict:
     """Extract semantic keywords and related terms."""
     generic_terms = ["post", "分享", "有咩", "什麼", "點樣", "如何", "係咩"]
     platform_terms = {"lihkg": ["吹水", "連登", "高登"], "reddit": ["subreddit", "YOLO", "DD"]}
@@ -523,14 +432,13 @@ History: {json.dumps(conversation_context, ensure_ascii=False)}
 Source: {source_type}
 Output: {{"keywords": [], "related_terms": [], "reason": "logic (max 70 chars)", "time_sensitive": true/false}}
 """
-    try:
-        api_key = st.secrets["grok3key"] if api_type == "grok" else st.secrets["chatanywhere_key"]
-    except KeyError:
-        logger.error(f"Missing {'Grok 3' if api_type == 'grok' else 'ChatAnywhere'} API key")
-        return {"keywords": [], "related_terms": [], "reason": "Missing API key", "time_sensitive": False}
-    messages = [{"role": "system", "content": f"Keyword analyzer for {source_type}"}, *conversation_context, {"role": "user", "content": prompt}]
-    api_response = await call_ai_api(api_type, api_key, messages, api_base_url, max_tokens=200, temperature=0.3)
-    if "error" not in api_response:
+    payload = {
+        "model": "grok-3",
+        "messages": [{"role": "system", "content": f"Keyword analyzer for {source_type}"}, *conversation_context, {"role": "user", "content": prompt}],
+        "max_tokens": 200,
+        "temperature": 0.3
+    }
+    if api_response := await call_grok3_api(payload, "extract_keywords"):
         try:
             result = json.loads(api_response["choices"][0]["message"]["content"])
             keywords = [kw for kw in result.get("keywords", []) if kw.lower() not in generic_terms]
@@ -542,21 +450,21 @@ Output: {{"keywords": [], "related_terms": [], "reason": "logic (max 70 chars)",
             }
         except json.JSONDecodeError:
             logger.error(f"JSON decode error in extract_keywords: response={api_response['choices'][0]['message']['content']}")
-    return {"keywords": [], "related_terms": [], "reason": f"API call failed: {api_response.get('error', 'Unknown error')}", "time_sensitive": False}
+    return {"keywords": [], "related_terms": [], "reason": "API call failed", "time_sensitive": False}
 
-async def extract_relevant_thread(conversation_context: List[Dict], query: str, grok3_api_key: str, api_type: str = "grok", api_base_url: str = None) -> Tuple[Optional[str], Optional[str], Optional[str], str]:
+async def extract_relevant_thread(conversation_context: List[Dict], query: str, grok3_api_key: str) -> Tuple[Optional[str], Optional[str], Optional[str], str]:
     """Extract relevant thread ID from history."""
     if len(conversation_context) < 2:
         return None, None, None, "No conversation history"
 
-    query_keyword_result = await extract_keywords(query, conversation_context, grok3_api_key, api_type=api_type, api_base_url=api_base_url)
+    query_keyword_result = await extract_keywords(query, conversation_context, grok3_api_key)
     query_keywords = query_keyword_result["keywords"] + query_keyword_result["related_terms"]
 
     for message in reversed(conversation_context):
         if message["role"] == "assistant" and "帖子 ID" in message["content"]:
             matches = re.findall(r"\[帖子 ID: ([a-zA-Z0-9]+)\] ([^\n]+)", message["content"])
             for thread_id, title in matches:
-                title_keyword_result = await extract_keywords(title, conversation_context, grok3_api_key, api_type=api_type, api_base_url=api_base_url)
+                title_keyword_result = await extract_keywords(title, conversation_context, grok3_api_key)
                 title_keywords = title_keyword_result["keywords"] + title_keyword_result["related_terms"]
                 common_keywords = set(query_keywords).intersection(title_keywords)
                 if common_keywords or any(kw.lower() in message["content"].lower() for kw in query_keywords):
@@ -569,21 +477,20 @@ History: {json.dumps(conversation_context, ensure_ascii=False)}
 Keywords: {query_keywords}
 Output: {{"thread_id": "id", "title": "title", "reason": "reason"}}
 """
-    try:
-        api_key = st.secrets["grok3key"] if api_type == "grok" else st.secrets["chatanywhere_key"]
-    except KeyError:
-        logger.error(f"Missing {'Grok 3' if api_type == 'grok' else 'ChatAnywhere'} API key")
-        return None, None, None, "Missing API key"
-    messages = [{"role": "system", "content": "Thread matching assistant"}, {"role": "user", "content": prompt}]
-    api_response = await call_ai_api(api_type, api_key, messages, api_base_url, max_tokens=100, temperature=0.5)
-    if "error" not in api_response:
+    payload = {
+        "model": "grok-3",
+        "messages": [{"role": "system", "content": "Thread matching assistant"}, {"role": "user", "content": prompt}],
+        "max_tokens": 100,
+        "temperature": 0.5
+    }
+    if api_response := await call_grok3_api(payload, "extract_relevant_thread"):
         try:
             result = json.loads(api_response["choices"][0]["message"]["content"])
             thread_id = result.get("thread_id")
             return thread_id, result.get("title"), None, result.get("reason", "No reason") if thread_id else "No match"
         except json.JSONDecodeError:
             logger.error(f"JSON decode error in extract_relevant_thread: response={api_response['choices'][0]['message']['content']}")
-    return None, None, None, f"API call failed: {api_response.get('error', 'Unknown error')}"
+    return None, None, None, "API call failed"
 
 def extract_thread_metadata(metadata: List[Dict]) -> List[Dict]:
     """Extract key fields from thread metadata."""
@@ -602,7 +509,7 @@ def extract_thread_metadata(metadata: List[Dict]) -> List[Dict]:
         logger.error(f"Error extracting metadata: {str(e)}")
         return []
 
-async def build_dynamic_prompt(query: str, conversation_context: List[Dict], metadata: List[Dict], thread_data: List[Dict], filters: Dict, intent: str, selected_source: Dict, grok3_api_key: str, api_type: str = "grok", api_base_url: str = None) -> str:
+async def build_dynamic_prompt(query: str, conversation_context: List[Dict], metadata: List[Dict], thread_data: List[Dict], filters: Dict, intent: str, selected_source: Dict, grok3_api_key: str) -> str:
     """Build dynamic prompt based on intent and data, incorporating context summary."""
     if isinstance(selected_source, str):
         source_name = selected_source
