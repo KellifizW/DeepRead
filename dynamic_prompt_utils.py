@@ -178,7 +178,7 @@ INTENT_CONFIG = {
             "confidence": 0.85,
             "reason": "Platform-specific query"
         },
-        "prompt_instruction": "Summarize 5 threads, identifying themes and sentiment ratios, directly addressing the query.",
+        "prompt_instruction": "Summarize 5 threads, identifying themes and sentiment ratios directly related to the query, excluding general platform background unless explicitly requested.",
         "prompt_format": "Paragraphs by theme, with table: | Theme | Ratio | Thread |",
         "word_range": (500, 4000),
         **DEFAULT_INTENT_CONFIG
@@ -552,7 +552,7 @@ async def build_dynamic_prompt(query: str, conversation_context: List[Dict], met
     format_instructions = [intent_config["prompt_format"]]
 
     platform_instruction = (
-        f"For {source_type}, incorporate platform-specific context (e.g., Reddit subreddits, LIHKG trends)."
+        f"For {source_type}, incorporate platform-specific context (e.g., Reddit subreddits, LIHKG trends) only if the query explicitly includes keywords like '平台背景' or '討論區特性'."
     )
     combined_instruction = (
         f"Generate a cohesive response ({word_min}-{word_max} words): {'; '.join(instruction_parts)} "
